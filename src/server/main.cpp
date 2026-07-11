@@ -1964,9 +1964,9 @@ private:
         const std::size_t pending = queued > processed ? queued - processed : 0;
         const double rate = static_cast<double>(processed) / elapsedSeconds;
         const std::size_t remaining = totalTarget > processed ? totalTarget - processed : 0;
-        const std::uint64_t etaSeconds = rate > 0.0
+        const std::uint64_t etaSeconds = final ? 0 : (rate > 0.0
             ? static_cast<std::uint64_t>(std::ceil(static_cast<double>(remaining) / rate))
-            : 0;
+            : 0);
         const double percent = totalTarget > 0
             ? (100.0 * static_cast<double>(std::min(processed, totalTarget)) / static_cast<double>(totalTarget))
             : 100.0;
@@ -2029,6 +2029,7 @@ private:
             IndexBuildStats stats;
             std::atomic_bool stopRequested{false};
             std::atomic_bool reporterDone{false};
+            std::atomic_bool monitorDone{false};
             std::mutex logMutex;
             std::mutex errorMutex;
             std::exception_ptr firstError;
@@ -2036,10 +2037,12 @@ private:
             const auto started = std::chrono::steady_clock::now();
 
             auto requestStop = [&] {
-                stopRequested.store(true);
+                const bool alreadyStopping = stopRequested.exchange(true);
                 cancellation->cancel();
                 inputQueue.close();
                 outputQueue.close();
+                reporterDone.store(true);
+                return !alreadyStopping;
             };
 
             auto setError = [&](std::exception_ptr error) {
@@ -2049,6 +2052,19 @@ private:
                 }
                 requestStop();
             };
+
+            std::thread interruptMonitor([&] {
+                while (!monitorDone.load()) {
+                    if (hki::interrupted()) {
+                        if (requestStop()) {
+                            std::lock_guard<std::mutex> lock(logMutex);
+                            std::cerr << "Interrupt requested; stopping PD_m invariant indexing after the current flush.\n";
+                        }
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            });
 
             std::thread producer([&] {
                 try {
@@ -2164,11 +2180,11 @@ private:
             });
 
             std::thread reporter([&] {
-                while (!reporterDone.load()) {
-                    for (int i = 0; i < progressIntervalSeconds && !reporterDone.load(); ++i) {
+                while (!reporterDone.load() && !stopRequested.load()) {
+                    for (int i = 0; i < progressIntervalSeconds && !reporterDone.load() && !stopRequested.load(); ++i) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                     }
-                    if (!reporterDone.load()) {
+                    if (!reporterDone.load() && !stopRequested.load()) {
                         printIndexProgress(stats, totalTarget, workers, started, false, logMutex);
                     }
                 }
@@ -2178,6 +2194,8 @@ private:
             for (std::thread& thread : computeThreads) thread.join();
             outputQueue.close();
             writer.join();
+            monitorDone.store(true);
+            interruptMonitor.join();
             reporterDone.store(true);
             reporter.join();
 
