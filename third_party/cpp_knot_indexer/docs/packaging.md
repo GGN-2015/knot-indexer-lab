@@ -122,6 +122,8 @@ On Windows, the build defines:
 - `KH_THREAD_BACKEND_WIN32`
 - `NOMINMAX`
 - links `ws2_32` for SQLite's Windows runtime dependencies
+- links `shell32` so the executables can parse the native Unicode command line
+  and accept non-ASCII paths independently of the console code page
 
 On other platforms, the build defines:
 

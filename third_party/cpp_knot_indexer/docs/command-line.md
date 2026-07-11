@@ -90,6 +90,16 @@ successful invariant strings to stderr.
 
 Print command usage.
 
+## Path Encoding
+
+On Windows, all executables read command line arguments from the native Unicode
+command line instead of relying on the narrow `argv` code page. This means paths
+passed to `--pd-file`, `--data-folder`, `--sqlite-db`, `--input`, and `--output`
+work whether the invoking shell is using a GBK-compatible code page or UTF-8.
+
+On Linux and macOS, paths are passed through as the native byte strings provided
+by the shell. UTF-8 paths are supported as usual.
+
 ## Output Contract
 
 Candidate knot names are written to stdout, one name per line.

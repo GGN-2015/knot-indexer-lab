@@ -55,6 +55,11 @@ std::string formatCoordinateLoop(const CoordinateLoop& loop);
 namespace cki::che_to_coord {
 namespace {
 
+std::string displayPath(const std::filesystem::path& path) {
+    auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
 struct SourceLine {
     std::size_t number = 0;
     std::string text;
@@ -407,7 +412,7 @@ inline CoordinateLoop parseCoordinateLoopText(const std::string& text, const Par
 inline CoordinateLoop readCoordinateLoopFile(const std::filesystem::path& path, const ParseOptions& options) {
     std::ifstream input(path);
     if (!input) {
-        throw ParseError("cannot open molecule file: " + path.string());
+        throw ParseError("cannot open molecule file: " + displayPath(path));
     }
     std::ostringstream buffer;
     buffer << input.rdbuf();

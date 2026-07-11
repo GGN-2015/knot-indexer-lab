@@ -3,6 +3,7 @@
 #include "khovanov_backend.hpp"
 #include "pd_simplify_backend.hpp"
 #include "pd_code.hpp"
+#include "path_utils.hpp"
 #include "process_runner.hpp"
 #include "runtime_control.hpp"
 #include "sqlite_database.hpp"
@@ -60,7 +61,7 @@ struct DataPaths {
 
 std::string readWholeFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot open file: " + path.string());
+    if (!in) throw std::runtime_error("cannot open file: " + cki::platform::displayPath(path));
     std::ostringstream buffer;
     buffer << in.rdbuf();
     return buffer.str();
@@ -68,7 +69,7 @@ std::string readWholeFile(const std::filesystem::path& path) {
 
 void writeWholeFile(const std::filesystem::path& path, const std::string& value) {
     std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("cannot write file: " + path.string());
+    if (!out) throw std::runtime_error("cannot write file: " + cki::platform::displayPath(path));
     out << value;
 }
 
@@ -85,7 +86,7 @@ void usage(std::ostream& out) {
         << "  --verbose           Print worker status, failures, and invariant strings to stderr.\n";
 }
 
-std::filesystem::path currentExecutablePath(const char* argv0) {
+std::filesystem::path currentExecutablePath(const std::filesystem::path& argv0) {
 #ifdef _WIN32
     std::wstring buffer(32768, L'\0');
     DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -110,7 +111,7 @@ std::filesystem::path currentExecutablePath(const char* argv0) {
         return std::filesystem::path(buffer);
     }
 #endif
-    return std::filesystem::absolute(argv0 ? argv0 : "");
+    return std::filesystem::absolute(argv0);
 }
 
 bool existsPath(const std::filesystem::path& path) {
@@ -178,7 +179,7 @@ DataPaths findDataPaths(const std::filesystem::path& executable,
     if (!userSqliteDb.empty()) {
         explicitSqliteDb = absolutePath(userSqliteDb);
         if (!existsPath(*explicitSqliteDb)) {
-            throw std::runtime_error("invalid --sqlite-db: " + explicitSqliteDb->string() +
+            throw std::runtime_error("invalid --sqlite-db: " + cki::platform::displayPath(*explicitSqliteDb) +
                                      "; file does not exist");
         }
     }
@@ -186,7 +187,7 @@ DataPaths findDataPaths(const std::filesystem::path& executable,
     if (!userFolder.empty()) {
         std::filesystem::path folder = absolutePath(userFolder);
         if (auto paths = tryResolveDataFolder(folder, explicitSqliteDb)) return *paths;
-        throw std::runtime_error("invalid --data-folder: " + folder.string() + "; " + dataFolderRequirement());
+        throw std::runtime_error("invalid --data-folder: " + cki::platform::displayPath(folder) + "; " + dataFolderRequirement());
     }
 
     std::filesystem::path exeDir = executable.parent_path();
@@ -196,34 +197,34 @@ DataPaths findDataPaths(const std::filesystem::path& executable,
     std::filesystem::path second = exeDir.parent_path() / "data";
     if (auto paths = tryResolveDataFolder(second, explicitSqliteDb)) return *paths;
 
-    throw std::runtime_error("cannot locate default data folder at " + first.string() +
-                             " or " + second.string() + "; pass --data-folder. " +
+    throw std::runtime_error("cannot locate default data folder at " + cki::platform::displayPath(first) +
+                             " or " + cki::platform::displayPath(second) + "; pass --data-folder. " +
                              dataFolderRequirement());
 }
 
-Options parseOptions(int argc, char** argv) {
+Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
     Options options;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto needValue = [&](const char* name) -> std::string {
-            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
-            return argv[i];
+    for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+        std::string arg = args[static_cast<std::size_t>(i)].text;
+        auto needValue = [&](const char* name) -> const cki::platform::ProgramArg& {
+            if (++i >= static_cast<int>(args.size())) throw std::runtime_error(std::string(name) + " needs a value");
+            return args[static_cast<std::size_t>(i)];
         };
 
         if (arg == "--help" || arg == "-h") {
             usage(std::cout);
             std::exit(0);
         } else if (arg == "--pd-code") {
-            options.pdText = needValue("--pd-code");
+            options.pdText = needValue("--pd-code").text;
         } else if (arg == "--pd-file") {
-            options.pdText = readWholeFile(needValue("--pd-file"));
+            options.pdText = readWholeFile(needValue("--pd-file").path);
         } else if (arg == "--timeout") {
-            options.timeoutSeconds = std::stoi(needValue("--timeout"));
+            options.timeoutSeconds = std::stoi(needValue("--timeout").text);
             if (options.timeoutSeconds < 0) throw std::runtime_error("--timeout must be >= 0");
         } else if (arg == "--data-folder") {
-            options.dataFolder = needValue("--data-folder");
+            options.dataFolder = needValue("--data-folder").path;
         } else if (arg == "--sqlite-db") {
-            options.sqliteDb = needValue("--sqlite-db");
+            options.sqliteDb = needValue("--sqlite-db").path;
         } else if (arg == "--print-invariants") {
             options.printInvariants = true;
         } else if (arg == "--verbose") {
@@ -545,20 +546,20 @@ void printPipelineDetails(const InvariantPipelineResult& pipeline, bool printVal
     }
 }
 
-int workerMain(int argc, char** argv) {
+int workerMain(const std::vector<cki::platform::ProgramArg>& args) {
     std::string worker;
     std::filesystem::path inputPath;
     std::filesystem::path outputPath;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto needValue = [&](const char* name) -> std::string {
-            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
-            return argv[i];
+    for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+        std::string arg = args[static_cast<std::size_t>(i)].text;
+        auto needValue = [&](const char* name) -> const cki::platform::ProgramArg& {
+            if (++i >= static_cast<int>(args.size())) throw std::runtime_error(std::string(name) + " needs a value");
+            return args[static_cast<std::size_t>(i)];
         };
-        if (arg == "--worker") worker = needValue("--worker");
-        else if (arg == "--input") inputPath = needValue("--input");
-        else if (arg == "--output") outputPath = needValue("--output");
+        if (arg == "--worker") worker = needValue("--worker").text;
+        else if (arg == "--input") inputPath = needValue("--input").path;
+        else if (arg == "--output") outputPath = needValue("--output").path;
     }
 
     if (worker.empty() || inputPath.empty() || outputPath.empty()) {
@@ -581,18 +582,19 @@ int workerMain(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     try {
-        for (int i = 1; i < argc; ++i) {
-            if (std::string(argv[i]) == "--worker") {
+        const std::vector<cki::platform::ProgramArg> args = cki::platform::programArguments(argc, argv);
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i].text == "--worker") {
                 hki::installInterruptHandlers();
-                return hki::workerMain(argc, argv);
+                return hki::workerMain(args);
             }
         }
 
         hki::installInterruptHandlers();
-        hki::Options options = hki::parseOptions(argc, argv);
+        hki::Options options = hki::parseOptions(args);
         hki::PDCode pd = hki::parsePDCode(options.pdText);
         std::string canonicalPd = hki::formatPDCodeList(pd);
-        std::filesystem::path executable = hki::currentExecutablePath(argv[0]);
+        std::filesystem::path executable = hki::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         hki::DataPaths dataPaths = hki::findDataPaths(executable, options.dataFolder, options.sqliteDb);
 
         hki::InvariantPipelineResult pipeline =
@@ -640,7 +642,8 @@ int main(int argc, char** argv) {
         if (candidates.empty() && dataPaths.textDbsAvailable) {
             if (options.verbose) {
                 std::cerr << "Invariant data source: text files "
-                          << dataPaths.homflyDb << " and " << dataPaths.khovanovDb << "\n";
+                          << cki::platform::displayPath(dataPaths.homflyDb) << " and "
+                          << cki::platform::displayPath(dataPaths.khovanovDb) << "\n";
             }
             hki::InvariantMap khDb = hki::loadInvariantMap(dataPaths.khovanovDb, normalizer);
             hki::InvariantMap homDb = hki::loadInvariantMap(dataPaths.homflyDb, normalizer);

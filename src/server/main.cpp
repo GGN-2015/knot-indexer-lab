@@ -15,6 +15,7 @@
 #include "link_pd_code.hpp"
 #include "pd_code.hpp"
 #include "pd_simplify_backend.hpp"
+#include "path_utils.hpp"
 #include "process_runner.hpp"
 #include "runtime_control.hpp"
 #include "sqlite3.h"
@@ -177,7 +178,7 @@ std::string localTimestamp() {
 
 std::string readWholeFile(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open file: " + path.string());
+    if (!input) throw std::runtime_error("cannot open file: " + cki::platform::displayPath(path));
     std::ostringstream buffer;
     buffer << input.rdbuf();
     return buffer.str();
@@ -185,7 +186,7 @@ std::string readWholeFile(const std::filesystem::path& path) {
 
 void writeWholeFile(const std::filesystem::path& path, const std::string& value) {
     std::ofstream output(path, std::ios::binary);
-    if (!output) throw std::runtime_error("cannot write file: " + path.string());
+    if (!output) throw std::runtime_error("cannot write file: " + cki::platform::displayPath(path));
     output << value;
 }
 
@@ -206,11 +207,10 @@ std::filesystem::path absolutePath(const std::filesystem::path& path) {
 }
 
 std::string pathUtf8(const std::filesystem::path& path) {
-    const auto value = path.u8string();
-    return std::string(value.begin(), value.end());
+    return cki::platform::sqliteOpenPath(path);
 }
 
-std::filesystem::path currentExecutablePath(const char* argv0) {
+std::filesystem::path currentExecutablePath(const std::filesystem::path& argv0) {
 #ifdef _WIN32
     std::wstring buffer(32768, L'\0');
     const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
@@ -235,7 +235,7 @@ std::filesystem::path currentExecutablePath(const char* argv0) {
         return std::filesystem::path(buffer);
     }
 #endif
-    return std::filesystem::absolute(argv0 ? argv0 : "");
+    return std::filesystem::absolute(argv0);
 }
 
 std::optional<DataPaths> tryResolveDataFolder(const std::filesystem::path& folder) {
@@ -818,20 +818,20 @@ private:
     }
 };
 
-int workerMain(int argc, char** argv) {
+int workerMain(const std::vector<cki::platform::ProgramArg>& args) {
     std::string worker;
     std::filesystem::path inputPath;
     std::filesystem::path outputPath;
 
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        auto needValue = [&](const char* name) -> std::string {
-            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
-            return argv[i];
+    for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+        const std::string arg = args[static_cast<std::size_t>(i)].text;
+        auto needValue = [&](const char* name) -> const cki::platform::ProgramArg& {
+            if (++i >= static_cast<int>(args.size())) throw std::runtime_error(std::string(name) + " needs a value");
+            return args[static_cast<std::size_t>(i)];
         };
-        if (arg == "--worker") worker = needValue("--worker");
-        else if (arg == "--input") inputPath = needValue("--input");
-        else if (arg == "--output") outputPath = needValue("--output");
+        if (arg == "--worker") worker = needValue("--worker").text;
+        else if (arg == "--input") inputPath = needValue("--input").path;
+        else if (arg == "--output") outputPath = needValue("--output").path;
     }
 
     if (worker.empty() || inputPath.empty() || outputPath.empty()) {
@@ -1102,7 +1102,7 @@ public:
                 openReadOnly();
                 refreshCounts();
             } catch (const std::exception& error) {
-                statusMessage_ = "SQLite database could not be opened at " + file_.string() + ": " + error.what();
+                statusMessage_ = "SQLite database could not be opened at " + cki::platform::displayPath(file_) + ": " + error.what();
                 close();
             }
         }
@@ -1126,10 +1126,10 @@ public:
     std::string statusMessage() const {
         if (!db_) {
             if (!statusMessage_.empty()) return statusMessage_;
-            return "SQLite database not found at " + file_.string() + ".";
+            return "SQLite database not found at " + cki::platform::displayPath(file_) + ".";
         }
         return "SQLite database: " + std::to_string(pdRecordCount_) + " PD records and " +
-               std::to_string(invariantRecordCount_) + " invariant records from " + file_.string();
+               std::to_string(invariantRecordCount_) + " invariant records from " + cki::platform::displayPath(file_);
     }
 
     std::optional<std::string> lookupPd(const std::string& rawName) const {
@@ -1205,10 +1205,10 @@ public:
 
     std::size_t importNamePdText(const std::filesystem::path& textFile, std::size_t limit) {
         if (!existsPath(textFile)) {
-            throw std::runtime_error("PD_m text database not found at " + textFile.string() + ".");
+            throw std::runtime_error("PD_m text database not found at " + cki::platform::displayPath(textFile) + ".");
         }
         std::ifstream input(textFile, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot open PD_m text database at " + textFile.string() + ".");
+        if (!input) throw std::runtime_error("cannot open PD_m text database at " + cki::platform::displayPath(textFile) + ".");
 
         std::lock_guard<std::mutex> lock(mutex_);
         openWritableIfNeeded();
@@ -1450,7 +1450,7 @@ public:
     void forEachRecord(Callback callback) const {
         if (!loaded_) return;
         std::ifstream input(file_, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot open PD_m database at " + file_.string() + ".");
+        if (!input) throw std::runtime_error("cannot open PD_m database at " + cki::platform::displayPath(file_) + ".");
 
         std::string line;
         while (std::getline(input, line)) {
@@ -1469,7 +1469,7 @@ public:
     }
 
     std::string statusMessage() const {
-        return loaded_ ? ("indexed " + std::to_string(recordCount_) + " PD_m record names from " + file_.string()) : loadMessage_;
+        return loaded_ ? ("indexed " + std::to_string(recordCount_) + " PD_m record names from " + cki::platform::displayPath(file_)) : loadMessage_;
     }
 
 private:
@@ -1504,12 +1504,12 @@ private:
 
     void load(const std::filesystem::path& file) {
         if (!existsPath(file)) {
-            loadMessage_ = "PD_m database not found at " + file.string() + ".";
+            loadMessage_ = "PD_m database not found at " + cki::platform::displayPath(file) + ".";
             return;
         }
         std::ifstream input(file, std::ios::binary);
         if (!input) {
-            loadMessage_ = "cannot open PD_m database at " + file.string() + ".";
+            loadMessage_ = "cannot open PD_m database at " + cki::platform::displayPath(file) + ".";
             return;
         }
 
@@ -1577,8 +1577,8 @@ public:
     }
 
     std::string statusMessage() const {
-        if (!loaded_) return "PD_m invariant index not found at " + file_.string() + ".";
-        return "loaded " + std::to_string(indexedNames_.size()) + " PD_m invariant records from " + file_.string();
+        if (!loaded_) return "PD_m invariant index not found at " + cki::platform::displayPath(file_) + ".";
+        return "loaded " + std::to_string(indexedNames_.size()) + " PD_m invariant records from " + cki::platform::displayPath(file_);
     }
 
     void append(const std::string& name,
@@ -1589,7 +1589,7 @@ public:
         if (canonicalName.empty() || indexedNames_.find(canonicalName) != indexedNames_.end()) return;
         std::filesystem::create_directories(file_.parent_path());
         std::ofstream out(file_, std::ios::app);
-        if (!out) throw std::runtime_error("cannot append PD_m invariant index: " + file_.string());
+        if (!out) throw std::runtime_error("cannot append PD_m invariant index: " + cki::platform::displayPath(file_));
         out << cleanFieldForTsv(canonicalName) << '\t'
             << cleanFieldForTsv(canonicalPd) << '\t'
             << cleanFieldForTsv(homfly) << '\t'
@@ -1623,7 +1623,7 @@ private:
     void load() {
         if (!existsPath(file_)) return;
         std::ifstream input(file_);
-        if (!input) throw std::runtime_error("cannot open PD_m invariant index: " + file_.string());
+        if (!input) throw std::runtime_error("cannot open PD_m invariant index: " + cki::platform::displayPath(file_));
         std::string line;
         while (std::getline(input, line)) {
             line = trim(line);
@@ -2556,28 +2556,28 @@ int parsePositiveInt(const std::string& value, const std::string& name) {
     return parsed;
 }
 
-Options parseOptions(int argc, char** argv) {
+Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
     Options options;
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        auto needValue = [&](const char* name) -> std::string {
-            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
-            return argv[i];
+    for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+        std::string arg = args[static_cast<std::size_t>(i)].text;
+        auto needValue = [&](const char* name) -> const cki::platform::ProgramArg& {
+            if (++i >= static_cast<int>(args.size())) throw std::runtime_error(std::string(name) + " needs a value");
+            return args[static_cast<std::size_t>(i)];
         };
 
         if (arg == "--help" || arg == "-h") {
             usage(std::cout);
             std::exit(0);
         } else if (arg == "--host") {
-            options.host = needValue("--host");
+            options.host = needValue("--host").text;
         } else if (arg == "--port") {
-            options.port = parsePositiveInt(needValue("--port"), "--port");
+            options.port = parsePositiveInt(needValue("--port").text, "--port");
         } else if (arg == "--data-folder") {
-            options.dataFolder = needValue("--data-folder");
+            options.dataFolder = needValue("--data-folder").path;
         } else if (arg == "--web-root") {
-            options.webRoot = needValue("--web-root");
+            options.webRoot = needValue("--web-root").path;
         } else if (arg == "--timeout") {
-            options.timeoutSeconds = parsePositiveInt(needValue("--timeout"), "--timeout");
+            options.timeoutSeconds = parsePositiveInt(needValue("--timeout").text, "--timeout");
             if (options.timeoutSeconds > kMaxComputeTimeoutSeconds) {
                 throw std::runtime_error("--timeout must not exceed 1200 seconds");
             }
@@ -2586,7 +2586,7 @@ Options parseOptions(int argc, char** argv) {
         } else if (arg == "--build-pd-index") {
             options.buildPdIndex = true;
         } else if (arg == "--index-limit") {
-            options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit"), "--index-limit"));
+            options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit").text, "--index-limit"));
         } else if (arg == "--worker") {
             return options;
         } else {
@@ -2601,16 +2601,17 @@ Options parseOptions(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     try {
-        for (int i = 1; i < argc; ++i) {
-            if (std::string(argv[i]) == "--worker") {
+        const std::vector<cki::platform::ProgramArg> args = cki::platform::programArguments(argc, argv);
+        for (std::size_t i = 1; i < args.size(); ++i) {
+            if (args[i].text == "--worker") {
                 hki::installInterruptHandlers();
-                return lab::workerMain(argc, argv);
+                return lab::workerMain(args);
             }
         }
 
         hki::installInterruptHandlers();
-        const lab::Options options = lab::parseOptions(argc, argv);
-        const std::filesystem::path executable = lab::currentExecutablePath(argv[0]);
+        const lab::Options options = lab::parseOptions(args);
+        const std::filesystem::path executable = lab::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
         lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, !options.buildSqlite);
         if (options.buildSqlite) {

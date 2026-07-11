@@ -61,6 +61,11 @@ std::string formatPDCode(const PDCode& pd_code);
 namespace cki::link_pd_code {
 namespace {
 
+std::string displayPath(const std::filesystem::path& path) {
+    auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
 struct Point2 {
@@ -903,7 +908,7 @@ inline Link parseLinkCoordinateText(const std::string& text) {
 inline Link readLinkCoordinateFile(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
-        throw ProjectionError("cannot open coordinate file: " + path.string());
+        throw ProjectionError("cannot open coordinate file: " + displayPath(path));
     }
     std::ostringstream buffer;
     buffer << input.rdbuf();

@@ -201,7 +201,11 @@ The `third_party/cpp_knot_indexer` tree is vendored from
 [`GGN-2015/cpp_knot_indexer`](https://github.com/GGN-2015/cpp_knot_indexer).
 It includes the HOMFLY-PT, Khovanov, and PD-code simplification
 implementations used by this server. This vendored copy was refreshed from
-upstream commit `d8e46f370c8dec6a8c7bd904ea31ca7febead9f2`.
+upstream commit `b1c606ddf01a6a0d733e050dd1059a65694d179f`.
+
+The server also uses the upstream Unicode path helpers. On Windows, command
+line paths are read from the native Unicode command line, so options such as
+`--data-folder` and `--web-root` can point at non-ASCII folders.
 
 The invariant pipeline now follows the upstream strategy: start HOMFLY-PT and
 Khovanov on the original PD code, run PD simplification in parallel, and retry

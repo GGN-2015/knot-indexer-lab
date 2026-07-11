@@ -156,13 +156,14 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
     system = platform.system().lower()
     if system == "windows":
         flags += ["-DKH_THREAD_BACKEND_WIN32", "-DNOMINMAX"]
-        link_flags: list[str] = ["-lws2_32"]
+        link_flags: list[str] = ["-lws2_32", "-lshell32"]
     else:
         flags += ["-DKH_THREAD_BACKEND_STD"]
         link_flags = ["-pthread"]
 
     flags += [
         "-I", str(ROOT / "src" / "knot_indexer"),
+        "-I", str(ROOT / "src" / "common"),
         "-I", str(ROOT / "src" / "che_to_coord"),
         "-I", str(ROOT / "src" / "link_pd_code"),
         "-I", str(ROOT / "third_party/libhomfly"),

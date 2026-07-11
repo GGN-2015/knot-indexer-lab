@@ -34,6 +34,14 @@ yet, and it also has its own `link_pd_code` command line executable.
 Use `#include "link_pd_code.hpp"` to consume the library directly. The matching
 `.cpp` file contains only the command line interface.
 
+`src/common`
+
+Small shared helpers used by command line entrypoints. `path_utils.hpp` provides
+native Unicode argv collection on Windows, UTF-8 diagnostic formatting, and the
+SQLite filename conversion used by the main indexer. The public algorithm
+headers do not require this directory unless an application wants to reuse the
+same CLI path behavior.
+
 `third_party/cppkh`
 
 Vendored MIT-licensed Khovanov implementation from `GGN-2015/cppkh`.

@@ -1,10 +1,12 @@
 #include "che_to_coord.hpp"
+#include "path_utils.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -17,7 +19,7 @@ std::string readAll(std::istream& input) {
 std::string readTextFile(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
-        throw cki::che_to_coord::ParseError("cannot open input file: " + path.string());
+        throw cki::che_to_coord::ParseError("cannot open input file: " + cki::platform::displayPath(path));
     }
     return readAll(input);
 }
@@ -25,7 +27,7 @@ std::string readTextFile(const std::filesystem::path& path) {
 void writeTextFile(const std::filesystem::path& path, const std::string& text) {
     std::ofstream output(path);
     if (!output) {
-        throw cki::che_to_coord::ParseError("cannot open output file: " + path.string());
+        throw cki::che_to_coord::ParseError("cannot open output file: " + cki::platform::displayPath(path));
     }
     output << text;
 }
@@ -57,17 +59,21 @@ void printUsage(std::ostream& output) {
         << "  --help, -h              Show this help text.\n";
 }
 
-std::string requireValue(int& index, int argc, char** argv, const std::string& option) {
-    if (index + 1 >= argc) {
+const cki::platform::ProgramArg& requireValue(
+    int& index,
+    const std::vector<cki::platform::ProgramArg>& args,
+    const std::string& option) {
+    if (index + 1 >= static_cast<int>(args.size())) {
         throw cki::che_to_coord::ParseError(option + " requires a value");
     }
     ++index;
-    return argv[index];
+    return args[static_cast<std::size_t>(index)];
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    const std::vector<cki::platform::ProgramArg> args = cki::platform::programArguments(argc, argv);
     std::filesystem::path input_path;
     std::filesystem::path output_path;
     bool have_input = false;
@@ -76,24 +82,24 @@ int main(int argc, char** argv) {
     cki::che_to_coord::ParseOptions options;
 
     try {
-        for (int i = 1; i < argc; ++i) {
-            const std::string arg = argv[i];
+        for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+            const std::string arg = args[static_cast<std::size_t>(i)].text;
             if (arg == "--help" || arg == "-h") {
                 printUsage(std::cout);
                 return 0;
             }
             if (arg == "--input" || arg == "-i") {
-                input_path = requireValue(i, argc, argv, arg);
+                input_path = requireValue(i, args, arg).path;
                 have_input = true;
                 continue;
             }
             if (arg == "--output" || arg == "-o") {
-                output_path = requireValue(i, argc, argv, arg);
+                output_path = requireValue(i, args, arg).path;
                 have_output = true;
                 continue;
             }
             if (arg == "--format") {
-                format = requireValue(i, argc, argv, arg);
+                format = requireValue(i, args, arg).text;
                 if (format != "link" && format != "atom-id") {
                     throw cki::che_to_coord::ParseError("--format must be 'link' or 'atom-id'");
                 }
@@ -109,7 +115,7 @@ int main(int argc, char** argv) {
             if (have_input) {
                 throw cki::che_to_coord::ParseError("multiple input paths were provided");
             }
-            input_path = arg;
+            input_path = args[static_cast<std::size_t>(i)].path;
             have_input = true;
         }
 

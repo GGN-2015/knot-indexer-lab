@@ -1,5 +1,7 @@
 #pragma once
 
+#include "path_utils.hpp"
+
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -166,7 +168,7 @@ inline std::string NameNormalizer::normalize(const std::string& knotName) const 
 
 inline InvariantMap loadInvariantMap(const std::filesystem::path& file, const NameNormalizer& normalizer) {
     std::ifstream in(file);
-    if (!in) throw std::runtime_error("cannot open invariant database: " + file.string());
+    if (!in) throw std::runtime_error("cannot open invariant database: " + cki::platform::displayPath(file));
 
     InvariantMap map;
     std::string line;

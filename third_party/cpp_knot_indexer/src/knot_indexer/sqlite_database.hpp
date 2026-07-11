@@ -1,6 +1,7 @@
 #pragma once
 
 #include "database.hpp"
+#include "path_utils.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -52,7 +53,7 @@ private:
 namespace sqlite_detail {
 
 inline std::string pathUtf8(const std::filesystem::path& path) {
-    return path.u8string();
+    return cki::platform::sqliteOpenPath(path);
 }
 
 inline bool existsPath(const std::filesystem::path& path) {
@@ -123,20 +124,20 @@ inline SqliteInvariantDatabase::SqliteInvariantDatabase(std::filesystem::path fi
         return;
     }
     if (!sqlite_detail::existsPath(file_)) {
-        statusMessage_ = "SQLite invariant database not found at " + file_.string() + ".";
+        statusMessage_ = "SQLite invariant database not found at " + cki::platform::displayPath(file_) + ".";
         return;
     }
 
     try {
         openReadOnly();
         if (!tableExists("invariants")) {
-            statusMessage_ = "SQLite database has no invariants table: " + file_.string() + ".";
+            statusMessage_ = "SQLite database has no invariants table: " + cki::platform::displayPath(file_) + ".";
             close();
             return;
         }
         invariantRecordCount_ = countRows("invariants");
     } catch (const std::exception& error) {
-        statusMessage_ = "SQLite database could not be opened at " + file_.string() + ": " + error.what();
+        statusMessage_ = "SQLite database could not be opened at " + cki::platform::displayPath(file_) + ": " + error.what();
         close();
     }
 }
@@ -148,7 +149,7 @@ inline SqliteInvariantDatabase::~SqliteInvariantDatabase() {
 inline std::string SqliteInvariantDatabase::statusMessage() const {
     if (!db_) return statusMessage_;
     return "SQLite invariant database: " + std::to_string(invariantRecordCount_) +
-           " records from " + file_.string();
+           " records from " + cki::platform::displayPath(file_);
 }
 
 inline std::vector<std::string> SqliteInvariantDatabase::lookup(

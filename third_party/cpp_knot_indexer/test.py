@@ -71,9 +71,16 @@ def run(cmd: list[str], *, stdin: str | None = None, timeout: int = 60) -> subpr
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
-        errors="replace",
+        errors="backslashreplace",
         timeout=timeout,
     )
+
+
+def safe_write(text: str, *, stream) -> None:
+    if not text:
+        return
+    encoding = stream.encoding or "utf-8"
+    stream.write(text.encode(encoding, errors="backslashreplace").decode(encoding))
 
 
 def build_if_needed(exe: Path, cxx: str | None, rebuild: bool, portable: bool) -> None:
@@ -86,8 +93,8 @@ def build_if_needed(exe: Path, cxx: str | None, rebuild: bool, portable: bool) -
         cmd += ["--portable"]
     proc = run(cmd, timeout=240)
     if proc.returncode != 0:
-        print(proc.stdout, end="")
-        print(proc.stderr, end="", file=sys.stderr)
+        safe_write(proc.stdout, stream=sys.stdout)
+        safe_write(proc.stderr, stream=sys.stderr)
         raise SystemExit(proc.returncode)
 
 
@@ -251,6 +258,40 @@ def assert_sqlite_data_source(exe: Path) -> None:
         ], timeout=30)
         if missing.returncode == 0 or "invalid --sqlite-db" not in missing.stderr:
             raise AssertionError(f"missing sqlite db should fail\nstdout={missing.stdout}\nstderr={missing.stderr}")
+
+
+def assert_unicode_path_arguments(exe: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="cki_unicode_") as tmp:
+        tmp_path = Path(tmp)
+        base = tmp_path / "unicode_\u4e2d\u6587\u8def\u5f84_\U0001f4c1"
+        base.mkdir()
+        pd_file = base / "pd_\u8f93\u5165.txt"
+        data = base / "data_\u6570\u636e\u76ee\u5f55"
+        sqlite_db = base / "sqlite_\u663e\u5f0f\u6570\u636e.db"
+
+        pd_file.write_text(str(CASES[2]["pd"]), encoding="utf-8")
+        shutil.copytree(ROOT / "data", data)
+        create_sqlite_invariant_db(sqlite_db, "UnicodePathTrefoil")
+
+        proc = run([
+            str(exe),
+            "--pd-file",
+            str(pd_file),
+            "--timeout",
+            "10",
+            "--data-folder",
+            str(data),
+            "--sqlite-db",
+            str(sqlite_db),
+            "--verbose",
+        ], timeout=30)
+        if proc.returncode != 0:
+            raise AssertionError(f"unicode path lookup failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
+        stdout_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if stdout_lines != ["UnicodePathTrefoil"]:
+            raise AssertionError(f"unicode path lookup returned {stdout_lines!r}\nstderr={proc.stderr}")
+        if "SQLite candidate count: 1" not in proc.stderr:
+            raise AssertionError(f"unicode path sqlite diagnostics missing\nstderr={proc.stderr}")
 
 
 def assert_missing_default_data_fails(exe: Path) -> None:
@@ -569,6 +610,41 @@ Bonds
                 f"link_pd_code crossing output failed\nstdout={crossing_pd.stdout}\nstderr={crossing_pd.stderr}"
             )
 
+        unicode_dir = Path(tmp) / "tool_\u4e2d\u6587\u8def\u5f84_\U0001f4c1"
+        unicode_dir.mkdir()
+        molecule_path = unicode_dir / "\u5206\u5b50\u8f93\u5165.data"
+        coordinate_path = unicode_dir / "\u5750\u6807\u8f93\u51fa.txt"
+        pd_path = unicode_dir / "pd_\u8f93\u51fa.txt"
+        molecule_path.write_text(molecule, encoding="utf-8")
+
+        che_file = run([
+            str(che_exe),
+            "--input",
+            str(molecule_path),
+            "--output",
+            str(coordinate_path),
+        ], timeout=30)
+        if che_file.returncode != 0 or not coordinate_path.exists():
+            raise AssertionError(
+                f"che_to_coord unicode path IO failed\nstdout={che_file.stdout}\nstderr={che_file.stderr}"
+            )
+
+        link_file = run([
+            str(link_exe),
+            "--input",
+            str(coordinate_path),
+            "--output",
+            str(pd_path),
+            "--direction",
+            "0",
+            "0",
+            "1",
+        ], timeout=30)
+        if link_file.returncode != 0 or pd_path.read_text(encoding="utf-8").strip() != "[]":
+            raise AssertionError(
+                f"link_pd_code unicode path IO failed\nstdout={link_file.stdout}\nstderr={link_file.stderr}"
+            )
+
         wrapper_dir = Path(tmp) / "wrapper-build"
         for script, exe_name in [
             (ROOT / "src" / "che_to_coord" / "build.py", CHE_TO_COORD_EXE),
@@ -615,6 +691,8 @@ def main() -> int:
     print("PASS data-folder")
     assert_sqlite_data_source(exe)
     print("PASS sqlite-data-source")
+    assert_unicode_path_arguments(exe)
+    print("PASS unicode-path-arguments")
     assert_missing_default_data_fails(exe)
     print("PASS missing-default-data")
     assert_timeout_degrades(exe)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "path_utils.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -91,7 +93,7 @@ inline std::string readFile(const std::filesystem::path& path) {
 
 inline void writeFile(const std::filesystem::path& path, const std::string& value) {
     std::ofstream out(path, std::ios::binary);
-    if (!out) throw std::runtime_error("cannot write temporary input file: " + path.string());
+    if (!out) throw std::runtime_error("cannot write temporary input file: " + cki::platform::displayPath(path));
     out << value;
 }
 

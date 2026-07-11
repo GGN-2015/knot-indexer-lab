@@ -1,10 +1,12 @@
 #include "link_pd_code.hpp"
+#include "path_utils.hpp"
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -17,7 +19,7 @@ std::string readAll(std::istream& input) {
 std::string readTextFile(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
-        throw cki::link_pd_code::ProjectionError("cannot open input file: " + path.string());
+        throw cki::link_pd_code::ProjectionError("cannot open input file: " + cki::platform::displayPath(path));
     }
     return readAll(input);
 }
@@ -25,7 +27,7 @@ std::string readTextFile(const std::filesystem::path& path) {
 void writeTextFile(const std::filesystem::path& path, const std::string& text) {
     std::ofstream output(path);
     if (!output) {
-        throw cki::link_pd_code::ProjectionError("cannot open output file: " + path.string());
+        throw cki::link_pd_code::ProjectionError("cannot open output file: " + cki::platform::displayPath(path));
     }
     output << text;
 }
@@ -55,12 +57,15 @@ void printUsage(std::ostream& output) {
         << "  --help, -h                    Show this help text.\n";
 }
 
-std::string requireValue(int& index, int argc, char** argv, const std::string& option) {
-    if (index + 1 >= argc) {
+const cki::platform::ProgramArg& requireValue(
+    int& index,
+    const std::vector<cki::platform::ProgramArg>& args,
+    const std::string& option) {
+    if (index + 1 >= static_cast<int>(args.size())) {
         throw cki::link_pd_code::ProjectionError(option + " requires a value");
     }
     ++index;
-    return argv[index];
+    return args[static_cast<std::size_t>(index)];
 }
 
 int parseInt(const std::string& text, const std::string& option) {
@@ -91,19 +96,23 @@ double parseDouble(const std::string& text, const std::string& option) {
     return value;
 }
 
-cki::link_pd_code::Point3 parseDirection(int& index, int argc, char** argv, const std::string& option) {
-    if (index + 3 >= argc) {
+cki::link_pd_code::Point3 parseDirection(
+    int& index,
+    const std::vector<cki::platform::ProgramArg>& args,
+    const std::string& option) {
+    if (index + 3 >= static_cast<int>(args.size())) {
         throw cki::link_pd_code::ProjectionError(option + " requires X Y Z values");
     }
-    const double x = parseDouble(argv[++index], option);
-    const double y = parseDouble(argv[++index], option);
-    const double z = parseDouble(argv[++index], option);
+    const double x = parseDouble(args[static_cast<std::size_t>(++index)].text, option);
+    const double y = parseDouble(args[static_cast<std::size_t>(++index)].text, option);
+    const double z = parseDouble(args[static_cast<std::size_t>(++index)].text, option);
     return cki::link_pd_code::Point3{x, y, z};
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    const std::vector<cki::platform::ProgramArg> args = cki::platform::programArguments(argc, argv);
     std::filesystem::path input_path;
     std::filesystem::path output_path;
     bool have_input = false;
@@ -111,32 +120,32 @@ int main(int argc, char** argv) {
     cki::link_pd_code::Options options;
 
     try {
-        for (int i = 1; i < argc; ++i) {
-            const std::string arg = argv[i];
+        for (int i = 1; i < static_cast<int>(args.size()); ++i) {
+            const std::string arg = args[static_cast<std::size_t>(i)].text;
             if (arg == "--help" || arg == "-h") {
                 printUsage(std::cout);
                 return 0;
             }
             if (arg == "--input" || arg == "-i") {
-                input_path = requireValue(i, argc, argv, arg);
+                input_path = requireValue(i, args, arg).path;
                 have_input = true;
                 continue;
             }
             if (arg == "--output" || arg == "-o") {
-                output_path = requireValue(i, argc, argv, arg);
+                output_path = requireValue(i, args, arg).path;
                 have_output = true;
                 continue;
             }
             if (arg == "--max-attempts") {
-                options.max_attempts = parseInt(requireValue(i, argc, argv, arg), arg);
+                options.max_attempts = parseInt(requireValue(i, args, arg).text, arg);
                 continue;
             }
             if (arg == "--epsilon") {
-                options.epsilon = parseDouble(requireValue(i, argc, argv, arg), arg);
+                options.epsilon = parseDouble(requireValue(i, args, arg).text, arg);
                 continue;
             }
             if (arg == "--direction") {
-                options.direction = parseDirection(i, argc, argv, arg);
+                options.direction = parseDirection(i, args, arg);
                 continue;
             }
             if (arg == "--first-generic") {
@@ -157,7 +166,7 @@ int main(int argc, char** argv) {
             if (have_input) {
                 throw cki::link_pd_code::ProjectionError("multiple input paths were provided");
             }
-            input_path = arg;
+            input_path = args[static_cast<std::size_t>(i)].path;
             have_input = true;
         }
 
