@@ -57,6 +57,10 @@ Build the invariant index for candidate lookup:
 build/knot_indexer_lab_server --build-pd-index
 ```
 
+By default this indexes knots with total crossing number <= 14, including
+composite knots whose factor crossing numbers sum to <= 14. Use
+`--max-crossing N` to choose a positive limit up to 16.
+
 For a small smoke test:
 
 ```sh

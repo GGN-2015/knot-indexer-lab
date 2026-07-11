@@ -41,6 +41,11 @@ builds with:
 build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
 ```
 
+Invariant indexing is limited by `--max-crossing`. The default is total
+crossing number <= 14, and the largest accepted value is 16. Composite names
+are still supported: the total is the sum of the crossing numbers of all
+comma-separated prime factors.
+
 If SQLite is not present, `--build-pd-index` writes the fallback TSV file:
 
 ```text

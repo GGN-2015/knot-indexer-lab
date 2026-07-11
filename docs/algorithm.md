@@ -35,6 +35,11 @@ Candidate lookup compares computed invariants against generated PD_m invariant
 records. SQLite is preferred when `PD_m_3-16.sqlite` exists. A TSV fallback is
 available when SQLite is not present.
 
+Generated invariant records are limited by `--max-crossing`, which defaults to
+14 and accepts values up to 16. Prime factors use the number after `K`, and
+composite names sum all comma-separated factors. Mirror prefixes do not change
+the crossing number.
+
 The SQLite invariant builder is optimized for large PD_m data:
 
 - one producer pages unindexed records from SQLite

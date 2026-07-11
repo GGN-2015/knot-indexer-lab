@@ -85,6 +85,7 @@ Server options:
 --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200
 --build-sqlite       Import PD_m_3-16.sorted.txt into SQLite, then exit
 --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit
+--max-crossing N     Maximum total crossing number. Default: 14, max: 16
 --index-limit N      Limit newly imported or indexed records in build modes
 --index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores
 --index-batch-size N SQLite invariant rows per write transaction. Default: 256
@@ -106,6 +107,10 @@ Build or extend the invariant index:
 ```sh
 build/knot_indexer_lab_server --build-pd-index
 ```
+
+This command indexes only knots whose total crossing number is at most
+`--max-crossing`. The default is 14, and the largest accepted value is 16. For
+a composite name, the total is the sum of all comma-separated prime factors.
 
 Run a bounded smoke test:
 

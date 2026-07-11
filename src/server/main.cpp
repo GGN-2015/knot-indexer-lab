@@ -73,6 +73,8 @@ namespace {
 
 constexpr int kDefaultPort = 5000;
 constexpr int kMaxComputeTimeoutSeconds = 20 * 60;
+constexpr int kDefaultMaxCrossing = 14;
+constexpr int kHardMaxCrossing = 16;
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes = 8 * 1024 * 1024;
 
@@ -94,6 +96,7 @@ struct Options {
     std::size_t indexWorkers = 0;
     std::size_t indexBatchSize = 256;
     int indexProgressSeconds = 5;
+    int maxCrossing = kDefaultMaxCrossing;
     std::filesystem::path dataFolder;
     std::filesystem::path webRoot;
 };
@@ -943,6 +946,56 @@ std::string normalizeNameSyntax(const std::string& rawName) {
     return out;
 }
 
+std::optional<int> parsePrimeFactorCrossings(const std::string& rawFactor) {
+    std::string factor = normalizeNameSyntax(rawFactor);
+    if (factor.empty()) return std::nullopt;
+    if (factor.size() > 1 && factor[0] == 'm') factor = factor.substr(1);
+    if (factor.size() < 4 || factor[0] != 'K') return std::nullopt;
+
+    std::size_t pos = 1;
+    if (pos >= factor.size() || !std::isdigit(static_cast<unsigned char>(factor[pos]))) {
+        return std::nullopt;
+    }
+
+    int crossings = 0;
+    while (pos < factor.size() && std::isdigit(static_cast<unsigned char>(factor[pos]))) {
+        crossings = crossings * 10 + (factor[pos] - '0');
+        if (crossings > 1000) return std::nullopt;
+        ++pos;
+    }
+
+    if (pos >= factor.size() || (factor[pos] != 'a' && factor[pos] != 'n')) return std::nullopt;
+    ++pos;
+    if (pos >= factor.size()) return std::nullopt;
+    while (pos < factor.size()) {
+        if (!std::isdigit(static_cast<unsigned char>(factor[pos]))) return std::nullopt;
+        ++pos;
+    }
+
+    return crossings;
+}
+
+std::optional<int> totalKnotCrossings(const std::string& rawName) {
+    int total = 0;
+    bool hasFactor = false;
+    std::size_t start = 0;
+    while (start <= rawName.size()) {
+        const std::size_t pos = rawName.find(',', start);
+        const std::string factor = rawName.substr(
+            start,
+            pos == std::string::npos ? std::string::npos : pos - start);
+        const std::optional<int> crossings = parsePrimeFactorCrossings(factor);
+        if (!crossings.has_value()) return std::nullopt;
+        total += *crossings;
+        if (total > 1000) return std::nullopt;
+        hasFactor = true;
+        if (pos == std::string::npos) break;
+        start = pos + 1;
+    }
+    if (!hasFactor) return std::nullopt;
+    return total;
+}
+
 class NameCanonicalizer {
 public:
     explicit NameCanonicalizer(const std::filesystem::path& knotNameRegDir) {
@@ -1431,6 +1484,50 @@ public:
         return records;
     }
 
+    std::vector<std::string> fetchUnindexedNamesAfter(const std::string& lastName, std::size_t limit) {
+        if (limit == 0) return {};
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!db_) return {};
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+
+        SqliteStatement stmt(
+            db_,
+            "SELECT p.name "
+            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
+            "WHERE i.name IS NULL AND (?1 = '' OR p.name > ?1) "
+            "ORDER BY p.name LIMIT ?2");
+        stmt.bindText(1, lastName);
+        stmt.bindInt64(2, static_cast<sqlite3_int64>(limit));
+
+        std::vector<std::string> names;
+        names.reserve(limit);
+        while (stmt.step() == SQLITE_ROW) {
+            names.push_back(stmt.columnText(0));
+        }
+        return names;
+    }
+
+    std::vector<Record> fetchRecordsByNames(const std::vector<std::string>& names) {
+        if (names.empty()) return {};
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!db_) return {};
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+
+        SqliteStatement stmt(db_, "SELECT pd FROM pd_records WHERE name = ?1");
+        std::vector<Record> records;
+        records.reserve(names.size());
+        for (const std::string& name : names) {
+            stmt.bindText(1, name);
+            if (stmt.step() == SQLITE_ROW) {
+                records.push_back(Record{name, stmt.columnText(0)});
+            }
+            stmt.reset();
+        }
+        return records;
+    }
+
     template <typename Callback>
     void forEachUnindexedRecord(Callback callback) {
         if (!hasPdRecords()) return;
@@ -1819,10 +1916,12 @@ public:
     KnotEngine(std::filesystem::path executable,
                DataPaths dataPaths,
                int timeoutSeconds,
+               int maxCrossing,
                bool loadTextFallback)
         : executable_(std::move(executable)),
           dataPaths_(std::move(dataPaths)),
           timeoutSeconds_(timeoutSeconds),
+          maxCrossing_(maxCrossing),
           nameCanonicalizer_(dataPaths_.knotNameRegDir),
           sqliteStore_(dataPaths_.sqliteFile, nameCanonicalizer_),
           pdRecords_(dataPaths_.namePdFile, nameCanonicalizer_, loadTextFallback && !sqliteStore_.hasPdRecords()),
@@ -1850,6 +1949,10 @@ public:
     }
 
     std::optional<std::string> lookupNamePd(const std::string& knotName, std::string& error) {
+        if (auto crossingError = crossingLimitError(knotName)) {
+            error = *crossingError;
+            return std::nullopt;
+        }
         if (auto pd = sqliteStore_.lookupPd(knotName)) return pd;
         return pdRecords_.lookup(knotName, error);
     }
@@ -1857,6 +1960,10 @@ public:
     std::string nameIndexStatus() const {
         return sqliteStore_.statusMessage() + "\nText fallback: " + pdRecords_.statusMessage() + "\n" +
                nameCanonicalizer_.statusMessage() + "\nInvariant index: " + invariantIndex_.statusMessage();
+    }
+
+    int maxCrossing() const {
+        return maxCrossing_;
     }
 
     std::size_t buildSqliteNameDatabase(std::size_t limit) {
@@ -1876,9 +1983,14 @@ public:
 
         std::size_t built = 0;
         std::size_t skipped = 0;
+        std::size_t outOfRange = 0;
         std::size_t failed = 0;
         pdRecords_.forEachRecord([&](const PdRecordDatabase::Record& record) -> bool {
             if (limit > 0 && built >= limit) return false;
+            if (!shouldBuildInvariantForName(record.name)) {
+                ++outOfRange;
+                return true;
+            }
             if (invariantIndex_.hasName(record.name)) {
                 ++skipped;
                 return true;
@@ -1916,6 +2028,10 @@ public:
 
         std::cerr << "PD_m invariant indexing complete: built " << built
                   << ", skipped " << skipped << ", failed " << failed << ".\n";
+        if (outOfRange > 0) {
+            std::cerr << "PD_m invariant indexing ignored " << outOfRange
+                      << " records outside total crossing <= " << maxCrossing_ << ".\n";
+        }
         return built;
     }
 
@@ -1923,6 +2039,7 @@ private:
     std::filesystem::path executable_;
     DataPaths dataPaths_;
     int timeoutSeconds_ = kMaxComputeTimeoutSeconds;
+    int maxCrossing_ = kDefaultMaxCrossing;
     NameCanonicalizer nameCanonicalizer_;
     PdSqliteStore sqliteStore_;
     PdRecordDatabase pdRecords_;
@@ -1948,6 +2065,49 @@ private:
         const unsigned int hardware = std::thread::hardware_concurrency();
         if (hardware == 0) return 2;
         return std::max<std::size_t>(1, static_cast<std::size_t>(hardware) / 2);
+    }
+
+    std::optional<int> crossingNumberForName(const std::string& rawName) const {
+        const std::string canonicalName = nameCanonicalizer_.normalize(rawName);
+        if (canonicalName.empty()) return std::nullopt;
+        return totalKnotCrossings(canonicalName);
+    }
+
+    bool shouldBuildInvariantForName(const std::string& rawName) const {
+        const std::optional<int> crossings = crossingNumberForName(rawName);
+        return crossings.has_value() && *crossings <= maxCrossing_;
+    }
+
+    std::optional<std::string> crossingLimitError(const std::string& rawName) const {
+        const std::optional<int> crossings = crossingNumberForName(rawName);
+        if (!crossings.has_value() || *crossings <= maxCrossing_) return std::nullopt;
+        return "knot total crossing number " + std::to_string(*crossings) +
+               " exceeds --max-crossing " + std::to_string(maxCrossing_) + ".";
+    }
+
+    std::vector<std::string> filterNamesByMaxCrossing(std::vector<std::string> names) const {
+        names.erase(std::remove_if(names.begin(), names.end(), [&](const std::string& name) {
+            return !shouldBuildInvariantForName(name);
+        }), names.end());
+        return names;
+    }
+
+    std::size_t countEligibleSqliteInvariantRecords(std::size_t limit, std::size_t pageSize) {
+        std::size_t count = 0;
+        std::string lastName;
+        const std::size_t chunkSize = std::max<std::size_t>(1, pageSize);
+        while (!hki::interrupted()) {
+            std::vector<std::string> names = sqliteStore_.fetchUnindexedNamesAfter(lastName, chunkSize);
+            if (names.empty()) break;
+            lastName = names.back();
+            for (const std::string& name : names) {
+                if (!shouldBuildInvariantForName(name)) continue;
+                ++count;
+                if (limit > 0 && count >= limit) return count;
+            }
+            if (names.size() < chunkSize) break;
+        }
+        return count;
     }
 
     static void printIndexProgress(const IndexBuildStats& stats,
@@ -1997,6 +2157,7 @@ private:
         const std::size_t batchSize = std::max<std::size_t>(1, requestedBatchSize);
         const int progressIntervalSeconds = std::max(1, progressSeconds);
         const std::size_t fetchChunk = std::max<std::size_t>(128, workers * 8);
+        const std::size_t recordFetchChunk = std::max<std::size_t>(4096, fetchChunk);
         const std::size_t queueCapacity = std::max<std::size_t>(fetchChunk * 2, workers * 16);
 
         sqliteStore_.beginInvariantBulkBuild();
@@ -2010,18 +2171,20 @@ private:
         };
 
         try {
-            const std::size_t unindexed = sqliteStore_.countUnindexedRecords();
-            const std::size_t totalTarget = limit > 0 ? std::min(limit, unindexed) : unindexed;
+            std::cerr << "Scanning SQLite PD_m records for unindexed knots with total crossing <= "
+                      << maxCrossing_ << ".\n";
+            const std::size_t totalTarget = countEligibleSqliteInvariantRecords(limit, recordFetchChunk);
             IndexBuildResult summary;
             summary.totalTarget = totalTarget;
             if (totalTarget == 0) {
-                std::cerr << "SQLite invariant indexing complete: no unindexed records remain.\n";
+                std::cerr << "SQLite invariant indexing complete: no eligible unindexed records remain.\n";
                 finishBulkBuild();
                 return summary;
             }
 
             std::cerr << "SQLite invariant indexing started: " << totalTarget
-                      << " records, " << workers << " compute workers, batch size "
+                      << " eligible records (total crossing <= " << maxCrossing_
+                      << "), " << workers << " compute workers, batch size "
                       << batchSize << ", progress interval " << progressIntervalSeconds << " seconds.\n";
 
             BlockingQueue<PdSqliteStore::Record> inputQueue(queueCapacity);
@@ -2070,21 +2233,41 @@ private:
                 try {
                     std::string lastName;
                     std::size_t submitted = 0;
-                    while (!stopRequested.load() && !hki::interrupted() && submitted < totalTarget) {
-                        const std::size_t remaining = totalTarget - submitted;
-                        const std::size_t wanted = std::min(fetchChunk, remaining);
-                        std::vector<PdSqliteStore::Record> records =
-                            sqliteStore_.fetchUnindexedRecordsAfter(lastName, wanted);
-                        if (records.empty()) break;
-                        lastName = records.back().name;
+                    bool keepProducing = true;
+                    std::vector<std::string> eligibleNames;
+                    eligibleNames.reserve(fetchChunk);
+
+                    auto submitBufferedNames = [&]() -> bool {
+                        if (eligibleNames.empty()) return true;
+                        std::vector<PdSqliteStore::Record> records = sqliteStore_.fetchRecordsByNames(eligibleNames);
+                        eligibleNames.clear();
                         for (PdSqliteStore::Record& record : records) {
-                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) break;
-                            if (!inputQueue.push(std::move(record), stopRequested)) break;
+                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) return false;
+                            if (!inputQueue.push(std::move(record), stopRequested)) return false;
                             ++submitted;
                             ++stats.queued;
                         }
-                        if (records.size() < wanted) break;
+                        return true;
+                    };
+
+                    while (keepProducing && !stopRequested.load() && !hki::interrupted() && submitted < totalTarget) {
+                        std::vector<std::string> names =
+                            sqliteStore_.fetchUnindexedNamesAfter(lastName, recordFetchChunk);
+                        if (names.empty()) break;
+                        lastName = names.back();
+                        for (const std::string& name : names) {
+                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) break;
+                            if (submitted + eligibleNames.size() >= totalTarget) break;
+                            if (!shouldBuildInvariantForName(name)) continue;
+                            eligibleNames.push_back(name);
+                            if (eligibleNames.size() >= fetchChunk && !submitBufferedNames()) {
+                                keepProducing = false;
+                                break;
+                            }
+                        }
+                        if (names.size() < recordFetchChunk) break;
                     }
+                    if (keepProducing) submitBufferedNames();
                 } catch (...) {
                     setError(std::current_exception());
                 }
@@ -2444,20 +2627,20 @@ private:
         if (!result.homfly.empty()) homfly = result.homfly;
         if (!result.khovanov.empty()) khovanov = result.khovanov;
 
-        result.candidates = sqliteStore_.lookupInvariants(homfly, khovanov);
+        result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupInvariants(homfly, khovanov));
         if (result.candidates.empty()) {
-            result.candidates = invariantIndex_.lookup(homfly, khovanov);
+            result.candidates = filterNamesByMaxCrossing(invariantIndex_.lookup(homfly, khovanov));
         }
         if (result.candidates.empty()) {
-            result.candidates = sqliteStore_.lookupByCanonicalPd(result.canonicalPd);
+            result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupByCanonicalPd(result.canonicalPd));
             if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
-                result.candidates = sqliteStore_.lookupByCanonicalPd(canonicalPd);
+                result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupByCanonicalPd(canonicalPd));
             }
         }
         if (result.candidates.empty()) {
-            result.candidates = pdRecords_.lookupByCanonicalPd(result.canonicalPd);
+            result.candidates = filterNamesByMaxCrossing(pdRecords_.lookupByCanonicalPd(result.canonicalPd));
             if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
-                result.candidates = pdRecords_.lookupByCanonicalPd(canonicalPd);
+                result.candidates = filterNamesByMaxCrossing(pdRecords_.lookupByCanonicalPd(canonicalPd));
             }
         }
         if (result.candidates.empty() && !sqliteStore_.hasInvariantRecords() && !invariantIndex_.loaded()) {
@@ -2826,6 +3009,7 @@ private:
             std::ostringstream info;
             info << "Pure C++ knot-indexer-lab server\n"
                  << "Invariant timeout: " << kMaxComputeTimeoutSeconds << " seconds\n"
+                 << "Maximum total crossing number: " << engine_.maxCrossing() << "\n"
                  << "PD_m data: " << engine_.nameIndexStatus() << "\n";
             return makeText(200, "OK", info.str(), "text/plain; charset=utf-8");
         }
@@ -2976,6 +3160,7 @@ void usage(std::ostream& out) {
         << "  --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200\n"
         << "  --build-sqlite       Import PD_m_3-16.sorted.txt into PD_m_3-16.sqlite, then exit.\n"
         << "  --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit.\n"
+        << "  --max-crossing N     Maximum total crossing number. Default: 14, max: 16\n"
         << "  --index-limit N      Limit newly imported or indexed records in build modes.\n"
         << "  --index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores.\n"
         << "  --index-batch-size N SQLite invariant rows per write transaction. Default: 256\n"
@@ -3024,6 +3209,11 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             options.buildSqlite = true;
         } else if (arg == "--build-pd-index") {
             options.buildPdIndex = true;
+        } else if (arg == "--max-crossing") {
+            options.maxCrossing = parsePositiveInt(needValue("--max-crossing").text, "--max-crossing");
+            if (options.maxCrossing > kHardMaxCrossing) {
+                throw std::runtime_error("--max-crossing must not exceed 16");
+            }
         } else if (arg == "--index-limit") {
             options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit").text, "--index-limit"));
         } else if (arg == "--index-workers") {
@@ -3058,7 +3248,7 @@ int main(int argc, char** argv) {
         const lab::Options options = lab::parseOptions(args);
         const std::filesystem::path executable = lab::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
-        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, !options.buildSqlite);
+        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing, !options.buildSqlite);
         if (options.buildSqlite) {
             engine.buildSqliteNameDatabase(options.indexLimit);
             return 0;

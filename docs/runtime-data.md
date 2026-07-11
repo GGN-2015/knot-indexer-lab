@@ -60,6 +60,12 @@ unindexed records through a bounded work queue, computes HOMFLY-PT and Khovanov
 in multiple worker lanes, writes successful rows in SQLite transactions, and
 prints periodic progress with `ETA HH:MM:SS`.
 
+The invariant index is intentionally limited by `--max-crossing`. The default
+limit is 14, and the largest accepted value is 16. For composite knot names,
+factors are comma-separated and the total crossing number is the sum of the
+crossing numbers of all factors; with the default limit, `K3a1,K11a1` is
+included and `K5a2,K10n39` is not.
+
 The batch index builder computes invariants directly from the stored PD_m PD
 code. It does not run PD simplification because the PD_m records are expected
 to be already minimized for this build stage.
