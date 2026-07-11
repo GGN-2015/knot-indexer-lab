@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <script src="/static/vue3/vue3.global.js"></script>
+    <link href="/static/bootstrap-5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+
+<body data-bs-theme="dark">
+    <div id="navbar"></div>
+    <div id="app"></div>
+
+    <div class="container mt-5">
+        <div id="indexer"></div>
+    </div>
+    <script src="/static/bootstrap-5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+
+<script type="module">
+    const { createApp } = Vue;
+    import NavBar from '/static/js/navbar.js';
+    import Indexer from '/static/js/indexer.js';
+
+    const navbar = createApp(NavBar);
+    const indexer = createApp(Indexer);
+
+    const app = createApp({
+        data() {
+            return {
+                website_title: "knot-indexer-lab",
+            };
+        },
+        async mounted() {
+            document.title = this.website_title;
+        },
+    });
+
+    app.mount('#app');
+    navbar.mount("#navbar");
+    indexer.mount("#indexer");
+</script>
+
+</html>

@@ -1,0 +1,141 @@
+# Command Line
+
+The main executable is `cpp_knot_indexer` on Unix-like systems and
+`cpp_knot_indexer.exe` on Windows.
+
+## Input Forms
+
+Provide a PD code directly:
+
+```sh
+build/cpp_knot_indexer --pd-code "[[1,5,2,4],[3,1,4,6],[5,3,6,2]]"
+```
+
+Read a PD code from a file:
+
+```sh
+build/cpp_knot_indexer --pd-file code.txt
+```
+
+Read a PD code from stdin:
+
+```sh
+build/cpp_knot_indexer < code.txt
+```
+
+## Runtime Options
+
+`--pd-code TEXT`
+
+Read the PD code from the command line.
+
+`--pd-file PATH`
+
+Read the PD code from a file.
+
+`--timeout SEC`
+
+Set the maximum number of seconds for one lookup pipeline. The timeout covers
+the original-PD HOMFLY-PT worker, original-PD Khovanov worker, simplification
+worker, and any simplified-PD HOMFLY-PT or Khovanov workers that are started
+after simplification finishes. The default is `60`. Use `0` to disable worker
+timeouts. Negative values are rejected.
+
+`--data-folder PATH`
+
+Use an explicit invariant database folder. A valid data folder must contain
+`knotname-reg/` and at least one invariant data source.
+
+Text invariant data source:
+
+- `homfly/sorted_HOMFLY-PT.txt`
+- `khovanov/sorted_khovanov.txt`
+
+SQLite invariant data source:
+
+- `knot-index.sqlite`
+- `knot_index.sqlite`
+- `invariants.sqlite`
+- `name-pd/PD_m_3-16.sqlite`
+
+When this option is present, the executable does not search default data folder
+locations. The folder name itself does not have to be `data`.
+
+`--sqlite-db PATH`
+
+Use an explicit SQLite invariant database. This overrides SQLite auto-detection
+inside the data folder, but the executable still needs a valid data folder for
+`knotname-reg/`.
+
+The SQLite database must contain an `invariants` table with these text columns:
+
+- `name`
+- `homfly`
+- `khovanov`
+
+The table may also contain `canonical_pd`, matching the SQLite database
+produced by `knot-indexer-lab`.
+
+`--print-invariants`
+
+Print the final HOMFLY-PT and Khovanov invariant strings to stderr.
+
+`--verbose`
+
+Print worker status, elapsed time, failure details, timeout details,
+simplified PD code, selected original/simplified invariant sources, and
+successful invariant strings to stderr.
+
+`--help`, `-h`
+
+Print command usage.
+
+## Output Contract
+
+Candidate knot names are written to stdout, one name per line.
+
+Diagnostics, verbose invariant strings, timeout messages, and worker failure
+details are written to stderr.
+
+For each invariant type, the original-PD and simplified-PD computations race
+when both are available. The first successful HOMFLY-PT result is used and the
+other HOMFLY-PT worker is cancelled; Khovanov follows the same rule. If one
+invariant type fails or times out but the other succeeds, lookup continues with
+the successful invariant. If both invariant types fail or time out, the program
+exits with status `2`.
+
+Pressing `Ctrl+C` requests a clean shutdown. Active worker processes are
+terminated and the program exits with status `130`.
+
+## Default Data Folder Search
+
+If `--data-folder` is not provided, the executable searches for a folder named
+`data` in this order:
+
+1. Next to the executable, such as `build/data`
+2. One directory above the executable, such as `data` when running
+   `build/cpp_knot_indexer`
+
+If neither location is valid, the program exits with an error.
+
+SQLite files are auto-detected only inside a valid data folder. Text invariant
+files remain supported and are used as a fallback if SQLite is absent or has no
+matching invariant record.
+
+## Internal Worker Options
+
+The executable uses internal worker options when spawning itself:
+
+- `--worker khovanov|homfly`
+- `--input PATH`
+- `--output PATH`
+
+These options are implementation details and are not intended as the public
+user interface.
+
+## Auxiliary Tools
+
+The coordinate conversion tools have separate executables and documentation:
+
+- [che_to_coord](che-to-coord.md)
+- [link_pd_code](link-pd-code.md)

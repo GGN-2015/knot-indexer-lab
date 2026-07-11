@@ -1,0 +1,2635 @@
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#endif
+
+#include "homfly_backend.hpp"
+#include "khovanov_backend.hpp"
+#include "link_pd_code.hpp"
+#include "pd_code.hpp"
+#include "pd_simplify_backend.hpp"
+#include "process_runner.hpp"
+#include "runtime_control.hpp"
+#include "sqlite3.h"
+
+#include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <limits.h>
+#elif !defined(_WIN32)
+#include <limits.h>
+#endif
+
+namespace lab {
+namespace {
+
+constexpr int kDefaultPort = 5000;
+constexpr int kMaxComputeTimeoutSeconds = 20 * 60;
+constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
+constexpr std::size_t kMaxBodyBytes = 8 * 1024 * 1024;
+
+#ifdef _WIN32
+using Socket = SOCKET;
+constexpr Socket kInvalidSocket = INVALID_SOCKET;
+#else
+using Socket = int;
+constexpr Socket kInvalidSocket = -1;
+#endif
+
+struct Options {
+    std::string host = "0.0.0.0";
+    int port = kDefaultPort;
+    int timeoutSeconds = kMaxComputeTimeoutSeconds;
+    bool buildSqlite = false;
+    bool buildPdIndex = false;
+    std::size_t indexLimit = 0;
+    std::filesystem::path dataFolder;
+    std::filesystem::path webRoot;
+};
+
+struct DataPaths {
+    std::filesystem::path root;
+    std::filesystem::path namePdFile;
+    std::filesystem::path sqliteFile;
+    std::filesystem::path invariantIndexFile;
+    std::filesystem::path knotNameRegDir;
+};
+
+struct Request {
+    std::string method;
+    std::string target;
+    std::string path;
+    std::map<std::string, std::string> headers;
+    std::string body;
+};
+
+struct Response {
+    int status = 200;
+    std::string reason = "OK";
+    std::map<std::string, std::string> headers;
+    std::string body;
+
+    std::string serialize() const {
+        std::ostringstream out;
+        out << "HTTP/1.1 " << status << " " << reason << "\r\n";
+        out << "Content-Length: " << body.size() << "\r\n";
+        out << "Connection: close\r\n";
+        for (const auto& item : headers) {
+            out << item.first << ": " << item.second << "\r\n";
+        }
+        out << "\r\n";
+        out << body;
+        return out.str();
+    }
+};
+
+struct LookupResult {
+    std::string canonicalPd;
+    std::string homfly;
+    std::string khovanov;
+    std::vector<std::string> candidates;
+    std::string candidateError;
+    hki::WorkerResult homflyWorker;
+    hki::WorkerResult khovanovWorker;
+};
+
+bool startsWith(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() &&
+           std::equal(prefix.begin(), prefix.end(), value.begin());
+}
+
+bool endsWith(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+           std::equal(suffix.rbegin(), suffix.rend(), value.rbegin());
+}
+
+std::string trim(const std::string& value) {
+    const char* ws = " \t\r\n";
+    const std::size_t first = value.find_first_not_of(ws);
+    if (first == std::string::npos) return "";
+    const std::size_t last = value.find_last_not_of(ws);
+    return value.substr(first, last - first + 1);
+}
+
+std::string lowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string localTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tm);
+    return buffer;
+}
+
+std::string readWholeFile(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot open file: " + path.string());
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+void writeWholeFile(const std::filesystem::path& path, const std::string& value) {
+    std::ofstream output(path, std::ios::binary);
+    if (!output) throw std::runtime_error("cannot write file: " + path.string());
+    output << value;
+}
+
+bool existsPath(const std::filesystem::path& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
+bool isDirectory(const std::filesystem::path& path) {
+    std::error_code ec;
+    return std::filesystem::is_directory(path, ec);
+}
+
+std::filesystem::path absolutePath(const std::filesystem::path& path) {
+    std::error_code ec;
+    std::filesystem::path out = std::filesystem::absolute(path, ec);
+    return ec ? path : out;
+}
+
+std::string pathUtf8(const std::filesystem::path& path) {
+    const auto value = path.u8string();
+    return std::string(value.begin(), value.end());
+}
+
+std::filesystem::path currentExecutablePath(const char* argv0) {
+#ifdef _WIN32
+    std::wstring buffer(32768, L'\0');
+    const DWORD n = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (n > 0 && n < buffer.size()) {
+        buffer.resize(n);
+        return std::filesystem::path(buffer);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::string buffer(size + 1, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &size) == 0) {
+        char resolved[PATH_MAX];
+        if (realpath(buffer.c_str(), resolved)) return std::filesystem::path(resolved);
+        return std::filesystem::path(buffer.c_str());
+    }
+#else
+    char buffer[PATH_MAX];
+    const ssize_t n = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
+    if (n > 0) {
+        buffer[n] = '\0';
+        return std::filesystem::path(buffer);
+    }
+#endif
+    return std::filesystem::absolute(argv0 ? argv0 : "");
+}
+
+std::optional<DataPaths> tryResolveDataFolder(const std::filesystem::path& folder) {
+    if (!isDirectory(folder)) return std::nullopt;
+    const std::filesystem::path nested = folder / "name-pd" / "PD_m_3-16.sorted.txt";
+    const std::filesystem::path flat = folder / "PD_m_3-16.sorted.txt";
+    const bool hasNestedFolder = isDirectory(folder / "name-pd");
+    const std::filesystem::path namePdFile = (existsPath(nested) || (!existsPath(flat) && hasNestedFolder)) ? nested : flat;
+    const std::filesystem::path sqliteFile = namePdFile.parent_path() / "PD_m_3-16.sqlite";
+    const std::filesystem::path indexFile = namePdFile.parent_path() / "PD_m_3-16.invariants.tsv";
+    return DataPaths{folder, namePdFile, sqliteFile, indexFile, folder / "knotname-reg"};
+}
+
+DataPaths resolveDataFolder(const std::filesystem::path& executable, const std::filesystem::path& userFolder) {
+    std::vector<std::filesystem::path> candidates;
+    if (!userFolder.empty()) candidates.push_back(userFolder);
+    const std::filesystem::path exeDir = executable.parent_path();
+    candidates.push_back(exeDir / "data");
+    candidates.push_back(exeDir.parent_path() / "data");
+    candidates.push_back(std::filesystem::current_path() / "data");
+
+    for (const std::filesystem::path& candidate : candidates) {
+        if (auto paths = tryResolveDataFolder(absolutePath(candidate))) return *paths;
+    }
+    throw std::runtime_error("cannot locate data folder; pass --data-folder");
+}
+
+std::filesystem::path resolveWebRoot(const std::filesystem::path& executable, const std::filesystem::path& userRoot) {
+    std::vector<std::filesystem::path> candidates;
+    if (!userRoot.empty()) candidates.push_back(userRoot);
+    const std::filesystem::path exeDir = executable.parent_path();
+    candidates.push_back(exeDir / "web");
+    candidates.push_back(exeDir.parent_path() / "web");
+    candidates.push_back(std::filesystem::current_path() / "web");
+
+    for (const std::filesystem::path& candidate : candidates) {
+        std::filesystem::path root = absolutePath(candidate);
+        if (existsPath(root / "index.html") && isDirectory(root / "static")) return root;
+    }
+    throw std::runtime_error("cannot locate web root; pass --web-root");
+}
+
+std::string jsonEscape(const std::string& value) {
+    std::ostringstream out;
+    for (unsigned char c : value) {
+        switch (c) {
+            case '\\': out << "\\\\"; break;
+            case '"': out << "\\\""; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    const char* hex = "0123456789abcdef";
+                    out << "\\u00" << hex[c >> 4] << hex[c & 0x0f];
+                } else {
+                    out << static_cast<char>(c);
+                }
+        }
+    }
+    return out.str();
+}
+
+std::string jsonArray(const std::vector<std::string>& values) {
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i) out << ",";
+        out << "\"" << jsonEscape(values[i]) << "\"";
+    }
+    out << "]";
+    return out.str();
+}
+
+Response makeText(int status, const std::string& reason, const std::string& body, const std::string& contentType) {
+    Response response;
+    response.status = status;
+    response.reason = reason;
+    response.body = body;
+    response.headers["Content-Type"] = contentType;
+    return response;
+}
+
+Response makeJsonStatus(const std::string& status, const std::string& message) {
+    return makeText(200, "OK",
+                    "{\"status\":\"" + jsonEscape(status) + "\",\"message\":\"" + jsonEscape(message) + "\"}",
+                    "application/json; charset=utf-8");
+}
+
+Response makeJsonSuccess(const std::string& message) {
+    return makeJsonStatus("success", message);
+}
+
+Response makeJsonError(const std::string& message) {
+    return makeJsonStatus("error", message);
+}
+
+int fromHex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+std::string urlDecode(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '%' && i + 2 < value.size()) {
+            const int hi = fromHex(value[i + 1]);
+            const int lo = fromHex(value[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(value[i]);
+    }
+    return out;
+}
+
+std::string base64Decode(const std::string& encoded) {
+    static const std::array<int, 256> table = [] {
+        std::array<int, 256> t{};
+        t.fill(-1);
+        const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < static_cast<int>(alphabet.size()); ++i) {
+            t[static_cast<unsigned char>(alphabet[static_cast<std::size_t>(i)])] = i;
+        }
+        return t;
+    }();
+
+    std::string out;
+    int value = 0;
+    int bits = -8;
+    for (unsigned char c : encoded) {
+        if (std::isspace(c)) continue;
+        if (c == '=') break;
+        const int digit = table[c];
+        if (digit < 0) throw std::runtime_error("invalid base64 input");
+        value = (value << 6) + digit;
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<char>((value >> bits) & 0xff));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+std::string base64Encode(const unsigned char* data, std::size_t size) {
+    static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((size + 2) / 3) * 4);
+    for (std::size_t i = 0; i < size; i += 3) {
+        const unsigned int b0 = data[i];
+        const unsigned int b1 = i + 1 < size ? data[i + 1] : 0;
+        const unsigned int b2 = i + 2 < size ? data[i + 2] : 0;
+        out.push_back(alphabet[(b0 >> 2) & 0x3f]);
+        out.push_back(alphabet[((b0 & 0x03) << 4) | ((b1 >> 4) & 0x0f)]);
+        out.push_back(i + 1 < size ? alphabet[((b1 & 0x0f) << 2) | ((b2 >> 6) & 0x03)] : '=');
+        out.push_back(i + 2 < size ? alphabet[b2 & 0x3f] : '=');
+    }
+    return out;
+}
+
+std::string base64Encode(const std::array<unsigned char, 20>& data) {
+    return base64Encode(data.data(), data.size());
+}
+
+std::uint32_t rotateLeft(std::uint32_t value, int bits) {
+    return (value << bits) | (value >> (32 - bits));
+}
+
+std::array<unsigned char, 20> sha1Bytes(const std::string& input) {
+    std::vector<unsigned char> data(input.begin(), input.end());
+    const std::uint64_t bitLength = static_cast<std::uint64_t>(data.size()) * 8;
+    data.push_back(0x80);
+    while (data.size() % 64 != 56) data.push_back(0);
+    for (int i = 7; i >= 0; --i) {
+        data.push_back(static_cast<unsigned char>((bitLength >> (i * 8)) & 0xff));
+    }
+
+    std::uint32_t h0 = 0x67452301;
+    std::uint32_t h1 = 0xefcdab89;
+    std::uint32_t h2 = 0x98badcfe;
+    std::uint32_t h3 = 0x10325476;
+    std::uint32_t h4 = 0xc3d2e1f0;
+
+    for (std::size_t offset = 0; offset < data.size(); offset += 64) {
+        std::array<std::uint32_t, 80> w{};
+        for (int i = 0; i < 16; ++i) {
+            const std::size_t j = offset + static_cast<std::size_t>(i) * 4;
+            w[i] = (static_cast<std::uint32_t>(data[j]) << 24) |
+                   (static_cast<std::uint32_t>(data[j + 1]) << 16) |
+                   (static_cast<std::uint32_t>(data[j + 2]) << 8) |
+                   static_cast<std::uint32_t>(data[j + 3]);
+        }
+        for (int i = 16; i < 80; ++i) {
+            w[i] = rotateLeft(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        }
+
+        std::uint32_t a = h0;
+        std::uint32_t b = h1;
+        std::uint32_t c = h2;
+        std::uint32_t d = h3;
+        std::uint32_t e = h4;
+
+        for (int i = 0; i < 80; ++i) {
+            std::uint32_t f = 0;
+            std::uint32_t k = 0;
+            if (i < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5a827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ed9eba1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8f1bbcdc;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xca62c1d6;
+            }
+            const std::uint32_t temp = rotateLeft(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = rotateLeft(b, 30);
+            b = a;
+            a = temp;
+        }
+
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
+    }
+
+    std::array<unsigned char, 20> digest{};
+    const std::array<std::uint32_t, 5> words{h0, h1, h2, h3, h4};
+    for (std::size_t i = 0; i < words.size(); ++i) {
+        digest[i * 4] = static_cast<unsigned char>((words[i] >> 24) & 0xff);
+        digest[i * 4 + 1] = static_cast<unsigned char>((words[i] >> 16) & 0xff);
+        digest[i * 4 + 2] = static_cast<unsigned char>((words[i] >> 8) & 0xff);
+        digest[i * 4 + 3] = static_cast<unsigned char>(words[i] & 0xff);
+    }
+    return digest;
+}
+
+std::string webSocketAcceptKey(const std::string& key) {
+    static const std::string guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    return base64Encode(sha1Bytes(key + guid));
+}
+
+std::string generateUuid() {
+    static const char* hex = "0123456789abcdef";
+    std::array<unsigned char, 16> bytes{};
+    std::random_device random;
+    for (unsigned char& b : bytes) b = static_cast<unsigned char>(random());
+    bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0f) | 0x40);
+    bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3f) | 0x80);
+
+    std::string out;
+    out.reserve(36);
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) out.push_back('-');
+        out.push_back(hex[(bytes[i] >> 4) & 0x0f]);
+        out.push_back(hex[bytes[i] & 0x0f]);
+    }
+    return out;
+}
+
+bool isUuidLike(const std::string& value) {
+    if (value.size() != 36) return false;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const char c = value[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else if (!std::isxdigit(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::string> cookieValue(const Request& request, const std::string& name) {
+    const auto found = request.headers.find("cookie");
+    if (found == request.headers.end()) return std::nullopt;
+    std::size_t start = 0;
+    while (start <= found->second.size()) {
+        const std::size_t sep = found->second.find(';', start);
+        std::string part = trim(found->second.substr(start, sep == std::string::npos ? std::string::npos : sep - start));
+        const std::size_t eq = part.find('=');
+        if (eq != std::string::npos && trim(part.substr(0, eq)) == name) {
+            return trim(part.substr(eq + 1));
+        }
+        if (sep == std::string::npos) break;
+        start = sep + 1;
+    }
+    return std::nullopt;
+}
+
+struct ClientSession {
+    std::string id;
+    bool needsCookie = false;
+};
+
+ClientSession clientSessionFromRequest(const Request& request) {
+    const auto existing = cookieValue(request, "kil_client_id");
+    if (existing.has_value() && isUuidLike(*existing)) return ClientSession{*existing, false};
+    return ClientSession{generateUuid(), true};
+}
+
+std::string clientCookieHeaderValue(const ClientSession& session) {
+    return "kil_client_id=" + session.id + "; Path=/; Max-Age=31536000; SameSite=Lax; HttpOnly";
+}
+
+void attachClientCookie(Response& response, const ClientSession& session) {
+    if (!session.needsCookie) return;
+    response.headers["Set-Cookie"] = clientCookieHeaderValue(session);
+}
+
+std::optional<std::string> extractJsonString(const std::string& body, const std::string& key) {
+    const std::string quotedKey = "\"" + key + "\"";
+    std::size_t pos = body.find(quotedKey);
+    if (pos == std::string::npos) return std::nullopt;
+    pos = body.find(':', pos + quotedKey.size());
+    if (pos == std::string::npos) return std::nullopt;
+    ++pos;
+    while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) ++pos;
+    if (pos >= body.size() || body[pos] != '"') return std::nullopt;
+    ++pos;
+
+    std::string out;
+    while (pos < body.size()) {
+        char c = body[pos++];
+        if (c == '"') return out;
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+        if (pos >= body.size()) return std::nullopt;
+        const char esc = body[pos++];
+        switch (esc) {
+            case '"': out.push_back('"'); break;
+            case '\\': out.push_back('\\'); break;
+            case '/': out.push_back('/'); break;
+            case 'b': out.push_back('\b'); break;
+            case 'f': out.push_back('\f'); break;
+            case 'n': out.push_back('\n'); break;
+            case 'r': out.push_back('\r'); break;
+            case 't': out.push_back('\t'); break;
+            case 'u':
+                if (pos + 4 > body.size()) return std::nullopt;
+                out.push_back('?');
+                pos += 4;
+                break;
+            default:
+                return std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string> sortedUnique(std::vector<std::string> values) {
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    return values;
+}
+
+std::vector<std::string> intersectNames(const std::vector<std::string>& a, const std::vector<std::string>& b) {
+    std::vector<std::string> left = sortedUnique(a);
+    std::vector<std::string> right = sortedUnique(b);
+    std::vector<std::string> out;
+    std::set_intersection(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(out));
+    return out;
+}
+
+std::vector<std::string> mergeCandidates(const hki::WorkerResult& khResult,
+                                         const std::vector<std::string>& khNames,
+                                         const hki::WorkerResult& homResult,
+                                         const std::vector<std::string>& homNames) {
+    if (khResult.success && homResult.success && !khNames.empty() && !homNames.empty()) {
+        return intersectNames(khNames, homNames);
+    }
+    std::vector<std::string> combined;
+    if (khResult.success) combined.insert(combined.end(), khNames.begin(), khNames.end());
+    if (homResult.success) combined.insert(combined.end(), homNames.begin(), homNames.end());
+    return sortedUnique(combined);
+}
+
+std::string join(const std::vector<std::string>& values, const std::string& sep) {
+    std::ostringstream out;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i) out << sep;
+        out << values[i];
+    }
+    return out.str();
+}
+
+std::string workerFailureMessage(const char* name, const hki::WorkerResult& result) {
+    std::ostringstream out;
+    out << name << " ";
+    if (result.cancelled) {
+        out << "was cancelled";
+    } else if (result.timedOut) {
+        out << "timed out after " << result.seconds << "s";
+    } else if (result.interrupted) {
+        out << "was interrupted";
+    } else {
+        out << "failed with exit code " << result.exitCode;
+    }
+    if (!result.error.empty()) out << ": " << trim(result.error);
+    return out.str();
+}
+
+std::string workerStatusText(const hki::WorkerResult& result) {
+    if (result.success) return "success";
+    if (result.cancelled) return "cancelled";
+    if (result.timedOut) return "timed_out";
+    if (result.interrupted) return "interrupted";
+    if (result.exitCode != -1) return "failed";
+    return "pending";
+}
+
+struct TaskRecord {
+    std::uint64_t id = 0;
+    std::string clientId;
+    std::string status = "running";
+    std::string inputType;
+    std::string input;
+    std::string canonicalPd;
+    std::string knotTypes;
+    std::string homflyStatus = "pending";
+    std::string homflyResult;
+    std::string homflyError;
+    std::string khovanovStatus = "pending";
+    std::string khovanovResult;
+    std::string khovanovError;
+    std::string error;
+    std::string startedAt;
+    std::string endedAt;
+    bool cancelRequested = false;
+    std::shared_ptr<hki::CancellationToken> cancellation;
+};
+
+class TaskManager {
+public:
+    using TaskPtr = std::shared_ptr<TaskRecord>;
+
+    TaskPtr create(std::string clientId, std::string inputType, std::string input) {
+        auto task = std::make_shared<TaskRecord>();
+        task->id = nextId_.fetch_add(1, std::memory_order_relaxed);
+        task->clientId = std::move(clientId);
+        task->inputType = std::move(inputType);
+        task->input = std::move(input);
+        task->startedAt = localTimestamp();
+        task->cancellation = std::make_shared<hki::CancellationToken>();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tasks_.push_back(task);
+        }
+        return task;
+    }
+
+    bool cancel(std::uint64_t id, std::string& message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& task : tasks_) {
+            if (task->id != id) continue;
+            if (task->status != "running") {
+                message = "task is not running.";
+                return false;
+            }
+            task->cancelRequested = true;
+            if (task->cancellation) task->cancellation->cancel();
+            message = "termination requested.";
+            return true;
+        }
+        message = "task not found.";
+        return false;
+    }
+
+    void setCanonicalPd(const TaskPtr& task, const std::string& canonicalPd) {
+        if (!task) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        task->canonicalPd = canonicalPd;
+    }
+
+    void complete(const TaskPtr& task, const LookupResult& result) {
+        if (!task) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        task->canonicalPd = result.canonicalPd;
+        task->knotTypes = join(result.candidates, "; ");
+        task->homflyStatus = workerStatusText(result.homflyWorker);
+        task->homflyResult = result.homfly;
+        if (!result.homflyWorker.success) {
+            task->homflyError = workerFailureMessage("HOMFLY-PT", result.homflyWorker);
+        }
+        task->khovanovStatus = workerStatusText(result.khovanovWorker);
+        task->khovanovResult = result.khovanov;
+        if (!result.khovanovWorker.success) {
+            task->khovanovError = workerFailureMessage("Khovanov", result.khovanovWorker);
+        }
+        if (!result.candidateError.empty()) task->error = result.candidateError;
+        task->endedAt = localTimestamp();
+        if (result.homflyWorker.cancelled || result.khovanovWorker.cancelled || task->cancelRequested) {
+            task->status = "cancelled";
+        } else {
+            task->status = "completed";
+        }
+    }
+
+    void fail(const TaskPtr& task, const std::string& error) {
+        if (!task) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        task->endedAt = localTimestamp();
+        task->error = error;
+        task->status = task->cancelRequested ? "cancelled" : "failed";
+        if (task->cancelRequested) {
+            if (task->homflyStatus == "pending") task->homflyStatus = "cancelled";
+            if (task->khovanovStatus == "pending") task->khovanovStatus = "cancelled";
+        }
+    }
+
+    std::string toJson(const std::string& clientId = "") const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream out;
+        out << "{\"status\":\"success\",\"client_id\":\"" << jsonEscape(clientId) << "\",\"tasks\":[";
+        for (std::size_t i = 0; i < tasks_.size(); ++i) {
+            const auto& task = tasks_[i];
+            if (i) out << ",";
+            appendTaskJson(out, *task);
+        }
+        out << "],\"session_tasks\":[";
+        bool first = true;
+        const TaskRecord* latest = nullptr;
+        for (const auto& task : tasks_) {
+            if (task->clientId != clientId) continue;
+            if (!first) out << ",";
+            appendTaskJson(out, *task);
+            first = false;
+            latest = task.get();
+        }
+        out << "],\"last_session_task\":";
+        if (latest) appendTaskJson(out, *latest);
+        else out << "null";
+        out << "}";
+        return out.str();
+    }
+
+private:
+    std::atomic_uint64_t nextId_{1};
+    mutable std::mutex mutex_;
+    std::vector<TaskPtr> tasks_;
+
+    static void appendTaskJson(std::ostringstream& out, const TaskRecord& task) {
+        out << "{"
+            << "\"id\":" << task.id << ","
+            << "\"client_id\":\"" << jsonEscape(task.clientId) << "\","
+            << "\"status\":\"" << jsonEscape(task.status) << "\","
+            << "\"input_type\":\"" << jsonEscape(task.inputType) << "\","
+            << "\"input\":\"" << jsonEscape(task.input) << "\","
+            << "\"canonical_pd\":\"" << jsonEscape(task.canonicalPd) << "\","
+            << "\"started_at\":\"" << jsonEscape(task.startedAt) << "\","
+            << "\"ended_at\":\"" << jsonEscape(task.endedAt) << "\","
+            << "\"knot_types\":\"" << jsonEscape(task.knotTypes) << "\","
+            << "\"homfly_status\":\"" << jsonEscape(task.homflyStatus) << "\","
+            << "\"homfly_result\":\"" << jsonEscape(task.homflyResult) << "\","
+            << "\"homfly_error\":\"" << jsonEscape(task.homflyError) << "\","
+            << "\"khovanov_status\":\"" << jsonEscape(task.khovanovStatus) << "\","
+            << "\"khovanov_result\":\"" << jsonEscape(task.khovanovResult) << "\","
+            << "\"khovanov_error\":\"" << jsonEscape(task.khovanovError) << "\","
+            << "\"error\":\"" << jsonEscape(task.error) << "\","
+            << "\"cancel_requested\":" << (task.cancelRequested ? "true" : "false")
+            << "}";
+    }
+};
+
+int workerMain(int argc, char** argv) {
+    std::string worker;
+    std::filesystem::path inputPath;
+    std::filesystem::path outputPath;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto needValue = [&](const char* name) -> std::string {
+            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
+            return argv[i];
+        };
+        if (arg == "--worker") worker = needValue("--worker");
+        else if (arg == "--input") inputPath = needValue("--input");
+        else if (arg == "--output") outputPath = needValue("--output");
+    }
+
+    if (worker.empty() || inputPath.empty() || outputPath.empty()) {
+        throw std::runtime_error("bad worker invocation");
+    }
+
+    const hki::PDCode pd = hki::parsePDCode(readWholeFile(inputPath));
+    std::string value;
+    if (worker == "homfly") value = hki::computeHomflyPT(pd);
+    else if (worker == "khovanov") value = hki::computeKhovanov(pd);
+    else if (worker == "simplify") value = hki::computeSimplifiedPDCode(pd);
+    else throw std::runtime_error("unknown worker: " + worker);
+    writeWholeFile(outputPath, value);
+    return 0;
+}
+
+std::string normalizeNameSyntax(const std::string& rawName) {
+    std::string out;
+    for (unsigned char c : rawName) {
+        if (std::isspace(c)) continue;
+        char v = static_cast<char>(std::tolower(c));
+        if (v == 'k') v = 'K';
+        out.push_back(v);
+    }
+    return out;
+}
+
+class NameCanonicalizer {
+public:
+    explicit NameCanonicalizer(const std::filesystem::path& knotNameRegDir) {
+        loadNamePairs(knotNameRegDir / "name_pair.txt");
+        loadAmphichiral(knotNameRegDir / "amphichiral_list.txt");
+    }
+
+    std::string normalize(const std::string& rawName) const {
+        std::vector<std::string> parts;
+        std::size_t start = 0;
+        while (start <= rawName.size()) {
+            const std::size_t pos = rawName.find(',', start);
+            parts.push_back(normalizePrime(rawName.substr(start, pos == std::string::npos ? std::string::npos : pos - start)));
+            if (pos == std::string::npos) break;
+            start = pos + 1;
+        }
+
+        parts.erase(std::remove_if(parts.begin(), parts.end(), [](const std::string& value) {
+            return value.empty();
+        }), parts.end());
+        if (parts.empty()) return "";
+        std::sort(parts.begin(), parts.end());
+        return join(parts, ",");
+    }
+
+    std::string statusMessage() const {
+        std::ostringstream out;
+        out << "name canonicalizer: " << legacyToModern_.size() << " legacy aliases, "
+            << amphichiralModern_.size() << " amphichiral prime knots";
+        return out.str();
+    }
+
+private:
+    std::unordered_map<std::string, std::string> legacyToModern_;
+    std::unordered_map<std::string, std::string> modernToLegacy_;
+    std::unordered_set<std::string> amphichiralLegacy_;
+    std::unordered_set<std::string> amphichiralModern_;
+
+    std::string normalizePrime(const std::string& rawName) const {
+        std::string name = normalizeNameSyntax(rawName);
+        if (name.empty()) return "";
+
+        bool mirror = false;
+        if (name.size() > 1 && name[0] == 'm') {
+            mirror = true;
+            name = name.substr(1);
+        }
+
+        const std::string base = modernize(name);
+        if (isAmphichiral(base)) return base;
+        return mirror ? ("m" + base) : base;
+    }
+
+    std::string modernize(const std::string& rawBase) const {
+        const std::string base = normalizeNameSyntax(rawBase);
+        const auto legacy = legacyToModern_.find(base);
+        if (legacy != legacyToModern_.end()) return legacy->second;
+        return base;
+    }
+
+    bool isAmphichiral(const std::string& rawBase) const {
+        const std::string base = normalizeNameSyntax(rawBase);
+        if (amphichiralModern_.find(base) != amphichiralModern_.end()) return true;
+        if (amphichiralLegacy_.find(base) != amphichiralLegacy_.end()) return true;
+
+        const auto legacy = modernToLegacy_.find(base);
+        if (legacy != modernToLegacy_.end() &&
+            amphichiralLegacy_.find(legacy->second) != amphichiralLegacy_.end()) {
+            return true;
+        }
+
+        const auto modern = legacyToModern_.find(base);
+        return modern != legacyToModern_.end() &&
+               amphichiralModern_.find(modern->second) != amphichiralModern_.end();
+    }
+
+    void loadNamePairs(const std::filesystem::path& file) {
+        std::ifstream input(file);
+        if (!input) return;
+
+        std::string line;
+        while (std::getline(input, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream row(line);
+            std::string legacyRaw;
+            std::string modernRaw;
+            row >> legacyRaw >> modernRaw;
+            const std::string legacy = normalizeNameSyntax(legacyRaw);
+            const std::string modern = normalizeNameSyntax(modernRaw);
+            if (legacy.empty() || modern.empty()) continue;
+            legacyToModern_[legacy] = modern;
+            modernToLegacy_[modern] = legacy;
+        }
+    }
+
+    void loadAmphichiral(const std::filesystem::path& file) {
+        std::ifstream input(file);
+        if (!input) return;
+
+        std::string line;
+        while (std::getline(input, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            const std::string legacy = normalizeNameSyntax(line);
+            if (legacy.empty()) continue;
+            amphichiralLegacy_.insert(legacy);
+            amphichiralModern_.insert(modernize(legacy));
+        }
+    }
+};
+
+std::string cleanFieldForTsv(std::string value) {
+    for (char& c : value) {
+        if (c == '\t' || c == '\r' || c == '\n') c = ' ';
+    }
+    return trim(value);
+}
+
+std::vector<std::string> splitTabLine(const std::string& line) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (start <= line.size()) {
+        const std::size_t pos = line.find('\t', start);
+        parts.push_back(line.substr(start, pos == std::string::npos ? std::string::npos : pos - start));
+        if (pos == std::string::npos) break;
+        start = pos + 1;
+    }
+    return parts;
+}
+
+bool parseNamePdRecord(const std::string& rawLine, std::string& name, std::string& pd) {
+    std::size_t start = 0;
+    std::size_t end = rawLine.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(rawLine[start]))) ++start;
+    while (end > start && std::isspace(static_cast<unsigned char>(rawLine[end - 1]))) --end;
+    if (start >= end || rawLine[start] == '#') return false;
+    if (rawLine[start] == '[' && rawLine[end - 1] == ']') {
+        ++start;
+        --end;
+    }
+    const std::size_t sep = rawLine.find('|', start);
+    if (sep == std::string::npos || sep >= end) return false;
+    name = trim(rawLine.substr(start, sep - start));
+    pd = trim(rawLine.substr(sep + 1, end - sep - 1));
+    return !name.empty() && !pd.empty();
+}
+
+bool parseNamePdName(const std::string& rawLine, std::string& name) {
+    std::size_t start = 0;
+    std::size_t end = rawLine.size();
+    while (start < end && std::isspace(static_cast<unsigned char>(rawLine[start]))) ++start;
+    while (end > start && std::isspace(static_cast<unsigned char>(rawLine[end - 1]))) --end;
+    if (start >= end || rawLine[start] == '#') return false;
+    if (rawLine[start] == '[' && rawLine[end - 1] == ']') {
+        ++start;
+        --end;
+    }
+    const std::size_t sep = rawLine.find('|', start);
+    if (sep == std::string::npos || sep >= end) return false;
+    name = trim(rawLine.substr(start, sep - start));
+    return !name.empty();
+}
+
+std::optional<std::string> canonicalizePdText(const std::string& pdText) {
+    try {
+        return hki::formatPDCodeList(hki::parsePDCode(pdText));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::string sqliteError(sqlite3* db) {
+    return db ? sqlite3_errmsg(db) : "sqlite handle is null";
+}
+
+class SqliteStatement {
+public:
+    SqliteStatement(sqlite3* db, const std::string& sql) : db_(db) {
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt_, nullptr) != SQLITE_OK) {
+            throw std::runtime_error("sqlite prepare failed: " + sqliteError(db_));
+        }
+    }
+
+    ~SqliteStatement() {
+        if (stmt_) sqlite3_finalize(stmt_);
+    }
+
+    SqliteStatement(const SqliteStatement&) = delete;
+    SqliteStatement& operator=(const SqliteStatement&) = delete;
+
+    void bindText(int index, const std::string& value) {
+        if (sqlite3_bind_text(stmt_, index, value.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            throw std::runtime_error("sqlite bind failed: " + sqliteError(db_));
+        }
+    }
+
+    int step() {
+        const int rc = sqlite3_step(stmt_);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            throw std::runtime_error("sqlite step failed: " + sqliteError(db_));
+        }
+        return rc;
+    }
+
+    void stepDone() {
+        const int rc = step();
+        if (rc != SQLITE_DONE) throw std::runtime_error("sqlite statement returned an unexpected row");
+    }
+
+    std::string columnText(int index) const {
+        const unsigned char* value = sqlite3_column_text(stmt_, index);
+        return value ? reinterpret_cast<const char*>(value) : "";
+    }
+
+    std::size_t columnSize(int index) const {
+        return static_cast<std::size_t>(sqlite3_column_int64(stmt_, index));
+    }
+
+    void reset() {
+        sqlite3_reset(stmt_);
+        sqlite3_clear_bindings(stmt_);
+    }
+
+private:
+    sqlite3* db_ = nullptr;
+    sqlite3_stmt* stmt_ = nullptr;
+};
+
+class PdSqliteStore {
+public:
+    struct Record {
+        std::string name;
+        std::string pd;
+    };
+
+    PdSqliteStore(std::filesystem::path file, const NameCanonicalizer& names)
+        : file_(std::move(file)), names_(names) {
+        if (existsPath(file_)) {
+            try {
+                openReadOnly();
+                refreshCounts();
+            } catch (const std::exception& error) {
+                statusMessage_ = "SQLite database could not be opened at " + file_.string() + ": " + error.what();
+                close();
+            }
+        }
+    }
+
+    ~PdSqliteStore() {
+        close();
+    }
+
+    PdSqliteStore(const PdSqliteStore&) = delete;
+    PdSqliteStore& operator=(const PdSqliteStore&) = delete;
+
+    bool hasPdRecords() const {
+        return db_ && pdRecordCount_ > 0;
+    }
+
+    bool hasInvariantRecords() const {
+        return db_ && invariantRecordCount_ > 0;
+    }
+
+    std::string statusMessage() const {
+        if (!db_) {
+            if (!statusMessage_.empty()) return statusMessage_;
+            return "SQLite database not found at " + file_.string() + ".";
+        }
+        return "SQLite database: " + std::to_string(pdRecordCount_) + " PD records and " +
+               std::to_string(invariantRecordCount_) + " invariant records from " + file_.string();
+    }
+
+    std::optional<std::string> lookupPd(const std::string& rawName) const {
+        if (!hasPdRecords()) return std::nullopt;
+        const std::string name = names_.normalize(rawName);
+        if (name.empty()) return std::nullopt;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        SqliteStatement stmt(db_, "SELECT pd FROM pd_records WHERE name = ?");
+        stmt.bindText(1, name);
+        if (stmt.step() != SQLITE_ROW) return std::nullopt;
+        return stmt.columnText(0);
+    }
+
+    std::vector<std::string> lookupInvariants(const std::optional<std::string>& homfly,
+                                              const std::optional<std::string>& khovanov) const {
+        if (!hasInvariantRecords()) return {};
+        if (homfly.has_value() && khovanov.has_value()) {
+            std::vector<std::string> names = queryNames(
+                "SELECT name FROM invariants WHERE homfly = ? AND khovanov = ? ORDER BY name",
+                {*homfly, *khovanov});
+            if (!names.empty()) return names;
+        }
+        if (khovanov.has_value()) {
+            std::vector<std::string> names = queryNames(
+                "SELECT name FROM invariants WHERE khovanov = ? ORDER BY name",
+                {*khovanov});
+            if (!names.empty()) return names;
+        }
+        if (homfly.has_value()) {
+            return queryNames("SELECT name FROM invariants WHERE homfly = ? ORDER BY name", {*homfly});
+        }
+        return {};
+    }
+
+    std::vector<std::string> lookupByCanonicalPd(const std::string& canonicalPd) const {
+        if (!hasPdRecords() || canonicalPd.empty()) return {};
+        return queryNames("SELECT name FROM pd_records WHERE pd = ? ORDER BY name", {canonicalPd});
+    }
+
+    bool hasInvariantName(const std::string& rawName) const {
+        if (!hasInvariantRecords()) return false;
+        const std::string name = names_.normalize(rawName);
+        if (name.empty()) return false;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        SqliteStatement stmt(db_, "SELECT 1 FROM invariants WHERE name = ? LIMIT 1");
+        stmt.bindText(1, name);
+        return stmt.step() == SQLITE_ROW;
+    }
+
+    void appendInvariant(const std::string& rawName,
+                         const std::string& canonicalPd,
+                         const std::string& homfly,
+                         const std::string& khovanov) {
+        const std::string name = names_.normalize(rawName);
+        if (name.empty() || canonicalPd.empty() || homfly.empty() || khovanov.empty()) return;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+        ensureIndexesNoLock();
+        SqliteStatement stmt(
+            db_,
+            "INSERT OR REPLACE INTO invariants(name, canonical_pd, homfly, khovanov) VALUES (?, ?, ?, ?)");
+        stmt.bindText(1, name);
+        stmt.bindText(2, canonicalPd);
+        stmt.bindText(3, homfly);
+        stmt.bindText(4, khovanov);
+        stmt.stepDone();
+        ++invariantRecordCount_;
+    }
+
+    std::size_t importNamePdText(const std::filesystem::path& textFile, std::size_t limit) {
+        if (!existsPath(textFile)) {
+            throw std::runtime_error("PD_m text database not found at " + textFile.string() + ".");
+        }
+        std::ifstream input(textFile, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open PD_m text database at " + textFile.string() + ".");
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        openWritableIfNeeded();
+        configureBulkImportNoLock();
+        ensureSchemaNoLock();
+        execNoLock("BEGIN IMMEDIATE");
+
+        std::size_t imported = 0;
+        std::size_t seen = 0;
+        try {
+            SqliteStatement stmt(db_, "INSERT OR IGNORE INTO pd_records(name, pd) VALUES (?, ?)");
+            std::string line;
+            while (std::getline(input, line)) {
+                if (limit > 0 && imported >= limit) break;
+                std::string name;
+                std::string pd;
+                if (!parseNamePdRecord(line, name, pd)) continue;
+                name = names_.normalize(name);
+                if (name.empty()) continue;
+
+                stmt.bindText(1, name);
+                stmt.bindText(2, pd);
+                stmt.stepDone();
+                imported += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
+                stmt.reset();
+                ++seen;
+
+                if (seen % 50000 == 0) {
+                    execNoLock("COMMIT");
+                    std::cerr << "SQLite import progress: read " << seen << " rows, inserted "
+                              << imported << " canonical rows.\n";
+                    execNoLock("BEGIN IMMEDIATE");
+                }
+            }
+        execNoLock("COMMIT");
+        } catch (...) {
+            execNoLock("ROLLBACK");
+            throw;
+        }
+
+        ensureIndexesNoLock();
+        refreshCountsNoLock();
+        std::cerr << "SQLite PD_m import complete: inserted " << imported
+                  << " canonical rows into " << file_ << ".\n";
+        return imported;
+    }
+
+    template <typename Callback>
+    void forEachUnindexedRecord(Callback callback) {
+        if (!hasPdRecords()) return;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            openWritableIfNeeded();
+            ensureSchemaNoLock();
+        }
+        std::string name;
+        std::string pd;
+        SqliteStatement stmt(
+            db_,
+            "SELECT p.name, p.pd "
+            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
+            "WHERE i.name IS NULL ORDER BY p.name");
+
+        while (!hki::interrupted()) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                const int rc = stmt.step();
+                if (rc == SQLITE_DONE) break;
+                name = stmt.columnText(0);
+                pd = stmt.columnText(1);
+            }
+            if (!callback(Record{name, pd})) break;
+        }
+    }
+
+private:
+    std::filesystem::path file_;
+    const NameCanonicalizer& names_;
+    mutable std::mutex mutex_;
+    sqlite3* db_ = nullptr;
+    bool writable_ = false;
+    std::size_t pdRecordCount_ = 0;
+    std::size_t invariantRecordCount_ = 0;
+    std::string statusMessage_;
+
+    void close() {
+        if (db_) {
+            sqlite3_close(db_);
+            db_ = nullptr;
+        }
+        writable_ = false;
+        pdRecordCount_ = 0;
+        invariantRecordCount_ = 0;
+    }
+
+    void openReadOnly() {
+        open(SQLITE_OPEN_READONLY, false);
+    }
+
+    void openWritableIfNeeded() {
+        if (db_ && writable_) return;
+        if (db_) close();
+        std::filesystem::create_directories(file_.parent_path());
+        open(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, true);
+    }
+
+    void open(int flags, bool writable) {
+        sqlite3* db = nullptr;
+        const std::string filename = pathUtf8(file_);
+        const int rc = sqlite3_open_v2(filename.c_str(), &db, flags, nullptr);
+        if (rc != SQLITE_OK) {
+            std::string message = db ? sqlite3_errmsg(db) : "unknown sqlite open error";
+            if (db) sqlite3_close(db);
+            throw std::runtime_error(message);
+        }
+        db_ = db;
+        writable_ = writable;
+        sqlite3_busy_timeout(db_, 30000);
+    }
+
+    void execNoLock(const std::string& sql) {
+        char* error = nullptr;
+        const int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &error);
+        if (rc != SQLITE_OK) {
+            std::string message = error ? error : sqliteError(db_);
+            sqlite3_free(error);
+            throw std::runtime_error("sqlite exec failed: " + message);
+        }
+    }
+
+    void configureBulkImportNoLock() {
+        execNoLock("PRAGMA journal_mode=OFF");
+        execNoLock("PRAGMA synchronous=OFF");
+        execNoLock("PRAGMA temp_store=MEMORY");
+        execNoLock("PRAGMA locking_mode=EXCLUSIVE");
+    }
+
+    void ensureSchemaNoLock() {
+        execNoLock(
+            "CREATE TABLE IF NOT EXISTS pd_records("
+            "name TEXT PRIMARY KEY,"
+            "pd TEXT NOT NULL)");
+        execNoLock(
+            "CREATE TABLE IF NOT EXISTS invariants("
+            "name TEXT PRIMARY KEY,"
+            "canonical_pd TEXT NOT NULL,"
+            "homfly TEXT NOT NULL,"
+            "khovanov TEXT NOT NULL)");
+    }
+
+    void ensureIndexesNoLock() {
+        execNoLock("CREATE INDEX IF NOT EXISTS idx_pd_records_pd ON pd_records(pd)");
+        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_homfly ON invariants(homfly)");
+        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_khovanov ON invariants(khovanov)");
+        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_pair ON invariants(homfly, khovanov)");
+    }
+
+    bool tableExistsNoLock(const std::string& table) const {
+        SqliteStatement stmt(db_, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1");
+        stmt.bindText(1, table);
+        return stmt.step() == SQLITE_ROW;
+    }
+
+    std::size_t countRowsNoLock(const std::string& table) const {
+        SqliteStatement stmt(db_, "SELECT COUNT(*) FROM " + table);
+        if (stmt.step() != SQLITE_ROW) return 0;
+        return stmt.columnSize(0);
+    }
+
+    void refreshCounts() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refreshCountsNoLock();
+    }
+
+    void refreshCountsNoLock() {
+        pdRecordCount_ = tableExistsNoLock("pd_records") ? countRowsNoLock("pd_records") : 0;
+        invariantRecordCount_ = tableExistsNoLock("invariants") ? countRowsNoLock("invariants") : 0;
+    }
+
+    std::vector<std::string> queryNames(const std::string& sql, const std::vector<std::string>& values) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        SqliteStatement stmt(db_, sql);
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            stmt.bindText(static_cast<int>(i + 1), values[i]);
+        }
+        std::vector<std::string> names;
+        while (stmt.step() == SQLITE_ROW) {
+            names.push_back(stmt.columnText(0));
+        }
+        return sortedUnique(std::move(names));
+    }
+};
+
+class PdRecordDatabase {
+public:
+    struct Record {
+        std::string name;
+        std::string pd;
+        std::string canonicalPd;
+    };
+
+    PdRecordDatabase(const std::filesystem::path& file, const NameCanonicalizer& names, bool loadTextIndex)
+        : file_(file), names_(names) {
+        if (loadTextIndex) {
+            load(file);
+        } else {
+            loadMessage_ = "PD_m text index skipped because SQLite data is available.";
+        }
+        addFallback("K0a1", "[]");
+        addFallback("K3a1", "[[1,5,2,4],[3,1,4,6],[5,3,6,2]]");
+    }
+
+    std::optional<std::string> lookup(const std::string& rawName, std::string& error) const {
+        const std::string name = names_.normalize(rawName);
+        if (name.empty()) {
+            error = "knot name should not be empty.";
+            return std::nullopt;
+        }
+        const auto exact = nameToOffset_.find(name);
+        if (exact != nameToOffset_.end()) {
+            const auto pd = readPdAt(exact->second);
+            if (pd.has_value()) return pd;
+            error = "could not read PD_m record for " + name + ".";
+            return std::nullopt;
+        }
+        const auto fallback = fallbackNameToPd_.find(name);
+        if (fallback != fallbackNameToPd_.end()) return fallback->second;
+        error = loaded_ ? "knot not found in PD_m_3-16.sorted.txt." : loadMessage_;
+        return std::nullopt;
+    }
+
+    std::vector<std::string> lookupByCanonicalPd(const std::string& canonicalPd) const {
+        const auto found = fallbackCanonicalPdToNames_.find(canonicalPd);
+        if (found == fallbackCanonicalPdToNames_.end()) return {};
+        return found->second;
+    }
+
+    template <typename Callback>
+    void forEachRecord(Callback callback) const {
+        if (!loaded_) return;
+        std::ifstream input(file_, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open PD_m database at " + file_.string() + ".");
+
+        std::string line;
+        while (std::getline(input, line)) {
+            std::string name;
+            std::string pd;
+            if (!parseNamePdRecord(line, name, pd)) continue;
+            name = names_.normalize(name);
+            if (name.empty()) continue;
+            Record record{name, pd, ""};
+            if (!callback(record)) break;
+        }
+    }
+
+    bool loaded() const {
+        return loaded_;
+    }
+
+    std::string statusMessage() const {
+        return loaded_ ? ("indexed " + std::to_string(recordCount_) + " PD_m record names from " + file_.string()) : loadMessage_;
+    }
+
+private:
+    std::filesystem::path file_;
+    const NameCanonicalizer& names_;
+    std::unordered_map<std::string, std::streamoff> nameToOffset_;
+    std::unordered_map<std::string, std::string> fallbackNameToPd_;
+    std::unordered_map<std::string, std::vector<std::string>> fallbackCanonicalPdToNames_;
+    std::size_t recordCount_ = 0;
+    bool loaded_ = false;
+    std::string loadMessage_ = "PD_m database is not installed.";
+
+    void addFallback(const std::string& rawName, const std::string& pd) {
+        const std::string name = names_.normalize(rawName);
+        if (fallbackNameToPd_.find(name) != fallbackNameToPd_.end()) return;
+        const std::optional<std::string> canonical = canonicalizePdText(pd);
+        fallbackNameToPd_[name] = pd;
+        if (canonical.has_value()) fallbackCanonicalPdToNames_[*canonical].push_back(name);
+    }
+
+    std::optional<std::string> readPdAt(std::streamoff offset) const {
+        std::ifstream input(file_, std::ios::binary);
+        if (!input) return std::nullopt;
+        input.seekg(offset);
+        std::string line;
+        if (!std::getline(input, line)) return std::nullopt;
+        std::string name;
+        std::string pd;
+        if (!parseNamePdRecord(line, name, pd)) return std::nullopt;
+        return pd;
+    }
+
+    void load(const std::filesystem::path& file) {
+        if (!existsPath(file)) {
+            loadMessage_ = "PD_m database not found at " + file.string() + ".";
+            return;
+        }
+        std::ifstream input(file, std::ios::binary);
+        if (!input) {
+            loadMessage_ = "cannot open PD_m database at " + file.string() + ".";
+            return;
+        }
+
+        std::string line;
+        std::streamoff offset = static_cast<std::streamoff>(input.tellg());
+        while (std::getline(input, line)) {
+            std::string name;
+            if (!parseNamePdName(line, name)) {
+                offset = static_cast<std::streamoff>(input.tellg());
+                continue;
+            }
+            name = names_.normalize(name);
+            if (!name.empty() && nameToOffset_.find(name) == nameToOffset_.end()) {
+                nameToOffset_[name] = offset;
+            }
+            ++recordCount_;
+            offset = static_cast<std::streamoff>(input.tellg());
+        }
+        loaded_ = recordCount_ > 0;
+        if (!loaded_) loadMessage_ = "PD_m database was found but no records could be loaded.";
+        for (auto& item : fallbackCanonicalPdToNames_) item.second = sortedUnique(std::move(item.second));
+    }
+};
+
+class PdInvariantIndex {
+public:
+    PdInvariantIndex(const std::filesystem::path& file, const NameCanonicalizer& names)
+        : file_(file), names_(names) {
+        load();
+    }
+
+    bool loaded() const {
+        return loaded_;
+    }
+
+    std::size_t size() const {
+        return indexedNames_.size();
+    }
+
+    bool hasName(const std::string& name) const {
+        return indexedNames_.find(name) != indexedNames_.end();
+    }
+
+    std::vector<std::string> lookup(const std::optional<std::string>& homfly,
+                                    const std::optional<std::string>& khovanov) const {
+        if (homfly.has_value() && khovanov.has_value()) {
+            const auto pairFound = pairToNames_.find(pairKey(*homfly, *khovanov));
+            if (pairFound != pairToNames_.end()) return pairFound->second;
+
+            const auto homFound = homflyToNames_.find(*homfly);
+            const auto khoFound = khovanovToNames_.find(*khovanov);
+            if (homFound != homflyToNames_.end() && khoFound != khovanovToNames_.end()) {
+                return intersectNames(homFound->second, khoFound->second);
+            }
+        }
+        if (khovanov.has_value()) {
+            const auto found = khovanovToNames_.find(*khovanov);
+            if (found != khovanovToNames_.end()) return found->second;
+        }
+        if (homfly.has_value()) {
+            const auto found = homflyToNames_.find(*homfly);
+            if (found != homflyToNames_.end()) return found->second;
+        }
+        return {};
+    }
+
+    std::string statusMessage() const {
+        if (!loaded_) return "PD_m invariant index not found at " + file_.string() + ".";
+        return "loaded " + std::to_string(indexedNames_.size()) + " PD_m invariant records from " + file_.string();
+    }
+
+    void append(const std::string& name,
+                const std::string& canonicalPd,
+                const std::string& homfly,
+                const std::string& khovanov) {
+        const std::string canonicalName = names_.normalize(name);
+        if (canonicalName.empty() || indexedNames_.find(canonicalName) != indexedNames_.end()) return;
+        std::filesystem::create_directories(file_.parent_path());
+        std::ofstream out(file_, std::ios::app);
+        if (!out) throw std::runtime_error("cannot append PD_m invariant index: " + file_.string());
+        out << cleanFieldForTsv(canonicalName) << '\t'
+            << cleanFieldForTsv(canonicalPd) << '\t'
+            << cleanFieldForTsv(homfly) << '\t'
+            << cleanFieldForTsv(khovanov) << '\n';
+        add(canonicalName, homfly, khovanov);
+        loaded_ = true;
+    }
+
+private:
+    std::filesystem::path file_;
+    const NameCanonicalizer& names_;
+    bool loaded_ = false;
+    std::unordered_set<std::string> indexedNames_;
+    std::unordered_map<std::string, std::vector<std::string>> homflyToNames_;
+    std::unordered_map<std::string, std::vector<std::string>> khovanovToNames_;
+    std::unordered_map<std::string, std::vector<std::string>> pairToNames_;
+
+    static std::string pairKey(const std::string& homfly, const std::string& khovanov) {
+        return homfly + '\x1f' + khovanov;
+    }
+
+    void add(const std::string& rawName, const std::string& homfly, const std::string& khovanov) {
+        const std::string name = names_.normalize(rawName);
+        if (name.empty() || homfly.empty() || khovanov.empty()) return;
+        indexedNames_.insert(name);
+        homflyToNames_[homfly].push_back(name);
+        khovanovToNames_[khovanov].push_back(name);
+        pairToNames_[pairKey(homfly, khovanov)].push_back(name);
+    }
+
+    void load() {
+        if (!existsPath(file_)) return;
+        std::ifstream input(file_);
+        if (!input) throw std::runtime_error("cannot open PD_m invariant index: " + file_.string());
+        std::string line;
+        while (std::getline(input, line)) {
+            line = trim(line);
+            if (line.empty() || line[0] == '#') continue;
+            const std::vector<std::string> parts = splitTabLine(line);
+            if (parts.size() < 4) continue;
+            add(parts[0], parts[2], parts[3]);
+        }
+        loaded_ = !indexedNames_.empty();
+        for (auto& item : homflyToNames_) item.second = sortedUnique(std::move(item.second));
+        for (auto& item : khovanovToNames_) item.second = sortedUnique(std::move(item.second));
+        for (auto& item : pairToNames_) item.second = sortedUnique(std::move(item.second));
+    }
+};
+
+class KnotEngine {
+public:
+    KnotEngine(std::filesystem::path executable,
+               DataPaths dataPaths,
+               int timeoutSeconds,
+               bool loadTextFallback)
+        : executable_(std::move(executable)),
+          dataPaths_(std::move(dataPaths)),
+          timeoutSeconds_(timeoutSeconds),
+          nameCanonicalizer_(dataPaths_.knotNameRegDir),
+          sqliteStore_(dataPaths_.sqliteFile, nameCanonicalizer_),
+          pdRecords_(dataPaths_.namePdFile, nameCanonicalizer_, loadTextFallback && !sqliteStore_.hasPdRecords()),
+          invariantIndex_(dataPaths_.invariantIndexFile, nameCanonicalizer_) {}
+
+    LookupResult lookup(const std::string& pdText,
+                        const std::shared_ptr<hki::CancellationToken>& cancellation = nullptr) {
+        const hki::PDCode pd = hki::parsePDCode(pdText);
+        const std::string canonical = hki::formatPDCodeList(pd);
+        {
+            std::lock_guard<std::mutex> lock(cacheMutex_);
+            const auto found = cache_.find(canonical);
+            if (found != cache_.end()) return found->second;
+        }
+
+        LookupResult result = compute(canonical, cancellation);
+        const bool cacheable = !result.homflyWorker.cancelled &&
+                               !result.khovanovWorker.cancelled &&
+                               (result.homflyWorker.success || result.khovanovWorker.success);
+        if (cacheable) {
+            std::lock_guard<std::mutex> lock(cacheMutex_);
+            cache_[canonical] = result;
+        }
+        return result;
+    }
+
+    std::optional<std::string> lookupNamePd(const std::string& knotName, std::string& error) {
+        if (auto pd = sqliteStore_.lookupPd(knotName)) return pd;
+        return pdRecords_.lookup(knotName, error);
+    }
+
+    std::string nameIndexStatus() const {
+        return sqliteStore_.statusMessage() + "\nText fallback: " + pdRecords_.statusMessage() + "\n" +
+               nameCanonicalizer_.statusMessage() + "\nInvariant index: " + invariantIndex_.statusMessage();
+    }
+
+    std::size_t buildSqliteNameDatabase(std::size_t limit) {
+        return sqliteStore_.importNamePdText(dataPaths_.namePdFile, limit);
+    }
+
+    std::size_t buildPdInvariantIndex(std::size_t limit) {
+        if (sqliteStore_.hasPdRecords()) {
+            return buildSqliteInvariantIndex(limit);
+        }
+        if (!pdRecords_.loaded()) {
+            throw std::runtime_error("PD_m_3-16.sorted.txt is required before building the invariant index.");
+        }
+
+        std::size_t built = 0;
+        std::size_t skipped = 0;
+        std::size_t failed = 0;
+        pdRecords_.forEachRecord([&](const PdRecordDatabase::Record& record) -> bool {
+            if (limit > 0 && built >= limit) return false;
+            if (invariantIndex_.hasName(record.name)) {
+                ++skipped;
+                return true;
+            }
+            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
+            if (!canonicalPd.has_value()) {
+                ++skipped;
+                return true;
+            }
+
+            std::cerr << "indexing " << record.name << " (" << (built + 1) << " built so far)\n";
+            try {
+                LookupResult result = computeInvariants(*canonicalPd, nullptr);
+                if (result.homflyWorker.success && result.khovanovWorker.success) {
+                    invariantIndex_.append(record.name, *canonicalPd, result.homfly, result.khovanov);
+                    ++built;
+                } else {
+                    ++failed;
+                    std::cerr << "warning: could not index " << record.name << ": ";
+                    if (!result.homflyWorker.success) {
+                        std::cerr << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
+                    }
+                    if (!result.homflyWorker.success && !result.khovanovWorker.success) std::cerr << "; ";
+                    if (!result.khovanovWorker.success) {
+                        std::cerr << workerFailureMessage("Khovanov", result.khovanovWorker);
+                    }
+                    std::cerr << "\n";
+                }
+            } catch (const std::exception& error) {
+                ++failed;
+                std::cerr << "warning: could not index " << record.name << ": " << error.what() << "\n";
+            }
+            return !hki::interrupted();
+        });
+
+        std::cerr << "PD_m invariant indexing complete: built " << built
+                  << ", skipped " << skipped << ", failed " << failed << ".\n";
+        return built;
+    }
+
+private:
+    std::filesystem::path executable_;
+    DataPaths dataPaths_;
+    int timeoutSeconds_ = kMaxComputeTimeoutSeconds;
+    NameCanonicalizer nameCanonicalizer_;
+    PdSqliteStore sqliteStore_;
+    PdRecordDatabase pdRecords_;
+    PdInvariantIndex invariantIndex_;
+    std::mutex cacheMutex_;
+    std::unordered_map<std::string, LookupResult> cache_;
+
+    std::size_t buildSqliteInvariantIndex(std::size_t limit) {
+        std::size_t built = 0;
+        std::size_t skipped = 0;
+        std::size_t failed = 0;
+        sqliteStore_.forEachUnindexedRecord([&](const PdSqliteStore::Record& record) -> bool {
+            if (limit > 0 && built >= limit) return false;
+            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
+            if (!canonicalPd.has_value()) {
+                ++skipped;
+                return true;
+            }
+
+            std::cerr << "indexing " << record.name << " (" << (built + 1) << " built so far)\n";
+            try {
+                LookupResult result = computeInvariants(*canonicalPd, nullptr);
+                if (result.homflyWorker.success && result.khovanovWorker.success) {
+                    sqliteStore_.appendInvariant(record.name, *canonicalPd, result.homfly, result.khovanov);
+                    ++built;
+                } else {
+                    ++failed;
+                    std::cerr << "warning: could not index " << record.name << ": ";
+                    if (!result.homflyWorker.success) {
+                        std::cerr << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
+                    }
+                    if (!result.homflyWorker.success && !result.khovanovWorker.success) std::cerr << "; ";
+                    if (!result.khovanovWorker.success) {
+                        std::cerr << workerFailureMessage("Khovanov", result.khovanovWorker);
+                    }
+                    std::cerr << "\n";
+                }
+            } catch (const std::exception& error) {
+                ++failed;
+                std::cerr << "warning: could not index " << record.name << ": " << error.what() << "\n";
+            }
+            return !hki::interrupted();
+        });
+
+        std::cerr << "SQLite invariant indexing complete: built " << built
+                  << ", skipped " << skipped << ", failed " << failed << ".\n";
+        return built;
+    }
+
+    enum class InvariantKind {
+        Homfly,
+        Khovanov,
+    };
+
+    struct RunningAttempt {
+        InvariantKind kind;
+        std::string source;
+        std::unique_ptr<hki::WorkerProcess> process;
+    };
+
+    struct SelectedInvariant {
+        hki::WorkerResult result;
+        std::string source;
+        bool attempted = false;
+    };
+
+    static const char* workerNameFor(InvariantKind kind) {
+        return kind == InvariantKind::Homfly ? "homfly" : "khovanov";
+    }
+
+    static SelectedInvariant& selectedFor(SelectedInvariant& homfly,
+                                          SelectedInvariant& khovanov,
+                                          InvariantKind kind) {
+        return kind == InvariantKind::Homfly ? homfly : khovanov;
+    }
+
+    static bool hasRunningSource(const std::vector<RunningAttempt>& running,
+                                 InvariantKind kind,
+                                 const std::string& source) {
+        return std::any_of(running.begin(), running.end(), [kind, &source](const RunningAttempt& attempt) {
+            return attempt.kind == kind && attempt.source == source;
+        });
+    }
+
+    static void recordAttempt(SelectedInvariant& selected,
+                              const std::string& source,
+                              const hki::WorkerResult& workerResult) {
+        const bool hadAttempt = selected.attempted;
+        selected.attempted = true;
+        if (workerResult.success && !selected.result.success) {
+            selected.result = workerResult;
+            selected.source = source;
+        } else if (!selected.result.success && !workerResult.cancelled) {
+            selected.result = workerResult;
+            selected.source = source;
+        } else if (!selected.result.success && !hadAttempt) {
+            selected.result = workerResult;
+            selected.source = source;
+        }
+    }
+
+    static void cancelRunningKind(std::vector<RunningAttempt>& running, InvariantKind kind) {
+        for (RunningAttempt& attempt : running) {
+            if (attempt.kind == kind) cancelWorkerProcess(*attempt.process);
+        }
+    }
+
+    static void eraseCancelledAttempts(std::vector<RunningAttempt>& running) {
+        running.erase(
+            std::remove_if(running.begin(), running.end(), [](const RunningAttempt& attempt) {
+                return attempt.process->result().cancelled;
+            }),
+            running.end());
+    }
+
+    LookupResult computeInvariants(const std::string& canonicalPd,
+                                   const std::shared_ptr<hki::CancellationToken>& cancellation) {
+        const auto deadline = timeoutSeconds_ > 0
+            ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds_)
+            : std::chrono::steady_clock::time_point::max();
+
+        LookupResult result;
+        result.canonicalPd = canonicalPd;
+
+        SelectedInvariant homfly;
+        SelectedInvariant khovanov;
+        std::vector<RunningAttempt> running;
+
+        auto startInvariant = [&](InvariantKind kind, const std::string& source, const std::string& pdText) {
+            SelectedInvariant& selected = selectedFor(homfly, khovanov, kind);
+            if (selected.result.success || hasRunningSource(running, kind, source)) return;
+            running.push_back(RunningAttempt{
+                kind,
+                source,
+                hki::startWorkerProcess(executable_, workerNameFor(kind), pdText),
+            });
+        };
+
+        startInvariant(InvariantKind::Homfly, "original", canonicalPd);
+        startInvariant(InvariantKind::Khovanov, "original", canonicalPd);
+
+        std::unique_ptr<hki::WorkerProcess> simplify =
+            hki::startWorkerProcess(executable_, "simplify", canonicalPd);
+        hki::WorkerResult simplifyResult;
+        std::string simplifiedPd;
+        bool simplifyFinished = false;
+        bool simplifiedAttemptsStarted = false;
+
+        auto maybeStartSimplifiedAttempts = [&]() {
+            if (simplifiedAttemptsStarted || simplifiedPd.empty() || simplifiedPd == canonicalPd) return;
+            simplifiedAttemptsStarted = true;
+            result.canonicalPd = simplifiedPd;
+            if (!homfly.result.success) startInvariant(InvariantKind::Homfly, "simplified", simplifiedPd);
+            if (!khovanov.result.success) startInvariant(InvariantKind::Khovanov, "simplified", simplifiedPd);
+        };
+
+        auto cancelAll = [&]() {
+            if (simplify && !simplifyFinished) {
+                hki::cancelWorkerProcess(*simplify);
+                simplifyResult = hki::finishWorkerProcess(*simplify);
+                simplifyFinished = true;
+            }
+            for (RunningAttempt& attempt : running) {
+                hki::cancelWorkerProcess(*attempt.process);
+                hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
+                recordAttempt(selectedFor(homfly, khovanov, attempt.kind), attempt.source, workerResult);
+            }
+            running.clear();
+        };
+
+        while (true) {
+            if (cancellation && cancellation->cancelled()) {
+                cancelAll();
+                break;
+            }
+            if (hki::interrupted()) {
+                cancelAll();
+                homfly.result.interrupted = true;
+                khovanov.result.interrupted = true;
+                break;
+            }
+
+            if (simplify && !simplifyFinished && hki::pollWorkerProcess(*simplify, deadline)) {
+                simplifyResult = hki::finishWorkerProcess(*simplify);
+                simplifyFinished = true;
+                if (simplifyResult.success) {
+                    simplifiedPd = simplifyResult.output;
+                    maybeStartSimplifiedAttempts();
+                }
+            }
+
+            for (std::size_t i = 0; i < running.size();) {
+                RunningAttempt& attempt = running[i];
+                if (!hki::pollWorkerProcess(*attempt.process, deadline)) {
+                    ++i;
+                    continue;
+                }
+
+                hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
+                SelectedInvariant& selected = selectedFor(homfly, khovanov, attempt.kind);
+                const bool alreadySelected = selected.result.success;
+                recordAttempt(selected, attempt.source, workerResult);
+                if (workerResult.success && !alreadySelected) {
+                    cancelRunningKind(running, attempt.kind);
+                }
+                running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
+                eraseCancelledAttempts(running);
+            }
+
+            if (homfly.result.success && khovanov.result.success && simplify && !simplifyFinished) {
+                hki::cancelWorkerProcess(*simplify);
+                simplifyResult = hki::finishWorkerProcess(*simplify);
+                simplifyFinished = true;
+            }
+
+            if (simplifyFinished) maybeStartSimplifiedAttempts();
+            if (running.empty() && simplifyFinished) break;
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                if (simplify && !simplifyFinished) {
+                    hki::pollWorkerProcess(*simplify, deadline);
+                    simplifyResult = hki::finishWorkerProcess(*simplify);
+                    simplifyFinished = true;
+                }
+                for (RunningAttempt& attempt : running) {
+                    hki::pollWorkerProcess(*attempt.process, deadline);
+                    hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
+                    recordAttempt(selectedFor(homfly, khovanov, attempt.kind), attempt.source, workerResult);
+                }
+                running.clear();
+                break;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        result.homflyWorker = homfly.result;
+        result.khovanovWorker = khovanov.result;
+
+        if (hki::interrupted() ||
+            (result.homflyWorker.interrupted && !result.homflyWorker.cancelled) ||
+            (result.khovanovWorker.interrupted && !result.khovanovWorker.cancelled)) {
+            throw std::runtime_error("computation interrupted.");
+        }
+
+        if (result.homflyWorker.success) {
+            result.homfly = result.homflyWorker.output;
+        }
+        if (result.khovanovWorker.success) {
+            result.khovanov = result.khovanovWorker.output;
+        }
+        return result;
+    }
+
+    LookupResult compute(const std::string& canonicalPd,
+                         const std::shared_ptr<hki::CancellationToken>& cancellation) {
+        LookupResult result = computeInvariants(canonicalPd, cancellation);
+
+        std::optional<std::string> homfly;
+        std::optional<std::string> khovanov;
+        if (!result.homfly.empty()) homfly = result.homfly;
+        if (!result.khovanov.empty()) khovanov = result.khovanov;
+
+        result.candidates = sqliteStore_.lookupInvariants(homfly, khovanov);
+        if (result.candidates.empty()) {
+            result.candidates = invariantIndex_.lookup(homfly, khovanov);
+        }
+        if (result.candidates.empty()) {
+            result.candidates = sqliteStore_.lookupByCanonicalPd(result.canonicalPd);
+            if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
+                result.candidates = sqliteStore_.lookupByCanonicalPd(canonicalPd);
+            }
+        }
+        if (result.candidates.empty()) {
+            result.candidates = pdRecords_.lookupByCanonicalPd(result.canonicalPd);
+            if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
+                result.candidates = pdRecords_.lookupByCanonicalPd(canonicalPd);
+            }
+        }
+        if (result.candidates.empty() && !sqliteStore_.hasInvariantRecords() && !invariantIndex_.loaded()) {
+            result.candidateError =
+                "PD_m invariant index is not built. Generate PD_m_3-16.sqlite with --build-sqlite, "
+                "then run --build-pd-index.";
+        }
+        return result;
+    }
+};
+
+class SocketRuntime {
+public:
+    SocketRuntime() {
+#ifdef _WIN32
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) throw std::runtime_error("WSAStartup failed");
+#else
+        std::signal(SIGPIPE, SIG_IGN);
+#endif
+    }
+
+    ~SocketRuntime() {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+};
+
+void closeSocket(Socket socket) {
+    if (socket == kInvalidSocket) return;
+#ifdef _WIN32
+    closesocket(socket);
+#else
+    close(socket);
+#endif
+}
+
+bool sendAll(Socket socket, const std::string& value) {
+    const char* data = value.data();
+    std::size_t remaining = value.size();
+    while (remaining > 0) {
+#ifdef _WIN32
+        const int chunk = remaining > static_cast<std::size_t>(INT_MAX) ? INT_MAX : static_cast<int>(remaining);
+        const int sent = send(socket, data, chunk, 0);
+#else
+        const ssize_t sent = send(socket, data, remaining, 0);
+#endif
+        if (sent <= 0) return false;
+        data += sent;
+        remaining -= static_cast<std::size_t>(sent);
+    }
+    return true;
+}
+
+bool sendWebSocketText(Socket socket, const std::string& payload) {
+    std::string frame;
+    frame.reserve(payload.size() + 10);
+    frame.push_back(static_cast<char>(0x81));
+
+    const std::uint64_t size = static_cast<std::uint64_t>(payload.size());
+    if (size <= 125) {
+        frame.push_back(static_cast<char>(size));
+    } else if (size <= 0xffff) {
+        frame.push_back(static_cast<char>(126));
+        frame.push_back(static_cast<char>((size >> 8) & 0xff));
+        frame.push_back(static_cast<char>(size & 0xff));
+    } else {
+        frame.push_back(static_cast<char>(127));
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            frame.push_back(static_cast<char>((size >> shift) & 0xff));
+        }
+    }
+
+    frame.append(payload);
+    return sendAll(socket, frame);
+}
+
+std::optional<Request> readRequest(Socket socket) {
+    std::string data;
+    std::array<char, 4096> buffer{};
+    std::size_t headerEnd = std::string::npos;
+
+    while ((headerEnd = data.find("\r\n\r\n")) == std::string::npos) {
+        if (data.size() > kMaxHeaderBytes) throw std::runtime_error("request headers are too large");
+#ifdef _WIN32
+        const int n = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+#else
+        const ssize_t n = recv(socket, buffer.data(), buffer.size(), 0);
+#endif
+        if (n <= 0) return std::nullopt;
+        data.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+    headerEnd += 4;
+
+    std::istringstream headers(data.substr(0, headerEnd));
+    std::string requestLine;
+    if (!std::getline(headers, requestLine)) return std::nullopt;
+    if (!requestLine.empty() && requestLine.back() == '\r') requestLine.pop_back();
+
+    Request request;
+    {
+        std::istringstream line(requestLine);
+        std::string version;
+        line >> request.method >> request.target >> version;
+        if (request.method.empty() || request.target.empty()) throw std::runtime_error("bad request line");
+    }
+
+    std::string line;
+    while (std::getline(headers, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) break;
+        const std::size_t sep = line.find(':');
+        if (sep == std::string::npos) continue;
+        request.headers[lowerCopy(trim(line.substr(0, sep)))] = trim(line.substr(sep + 1));
+    }
+
+    const std::string::size_type query = request.target.find('?');
+    request.path = urlDecode(request.target.substr(0, query));
+
+    std::size_t contentLength = 0;
+    const auto foundLength = request.headers.find("content-length");
+    if (foundLength != request.headers.end()) {
+        contentLength = static_cast<std::size_t>(std::stoul(foundLength->second));
+        if (contentLength > kMaxBodyBytes) throw std::runtime_error("request body is too large");
+    }
+
+    while (data.size() < headerEnd + contentLength) {
+#ifdef _WIN32
+        const int n = recv(socket, buffer.data(), static_cast<int>(buffer.size()), 0);
+#else
+        const ssize_t n = recv(socket, buffer.data(), buffer.size(), 0);
+#endif
+        if (n <= 0) throw std::runtime_error("connection closed while reading request body");
+        data.append(buffer.data(), static_cast<std::size_t>(n));
+    }
+    request.body = data.substr(headerEnd, contentLength);
+    return request;
+}
+
+std::string mimeType(const std::filesystem::path& path) {
+    const std::string ext = lowerCopy(path.extension().string());
+    if (ext == ".html") return "text/html; charset=utf-8";
+    if (ext == ".js") return "text/javascript; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".map") return "application/json; charset=utf-8";
+    return "application/octet-stream";
+}
+
+std::optional<std::filesystem::path> safeWebPath(const std::filesystem::path& root, const std::string& relativeUrl) {
+    std::filesystem::path relative;
+    std::stringstream parts(relativeUrl);
+    std::string part;
+    while (std::getline(parts, part, '/')) {
+        part = urlDecode(part);
+        if (part.empty() || part == ".") continue;
+        if (part == ".." || part.find('\0') != std::string::npos) return std::nullopt;
+        relative /= part;
+    }
+    return root / relative;
+}
+
+Response serveFile(const std::filesystem::path& root, const std::string& relativeUrl) {
+    const auto path = safeWebPath(root, relativeUrl);
+    if (!path.has_value() || !existsPath(*path) || isDirectory(*path)) {
+        return makeText(404, "Not Found", "not found", "text/plain; charset=utf-8");
+    }
+    return makeText(200, "OK", readWholeFile(*path), mimeType(*path));
+}
+
+std::string decodeApiPayload(const std::string& path, const std::string& prefix) {
+    if (!startsWith(path, prefix)) throw std::runtime_error("internal API routing error");
+    const std::string encoded = urlDecode(path.substr(prefix.size()));
+    return base64Decode(encoded);
+}
+
+std::string normalizePdInput(const std::string& raw) {
+    std::string value = raw;
+    value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+        return std::isspace(c);
+    }), value.end());
+    return value;
+}
+
+std::vector<cki::link_pd_code::Point3> parseCoordinateRows(const std::string& raw) {
+    std::string text = raw;
+    for (char& c : text) {
+        if (c == '[' || c == ']' || c == ';' || c == ',') c = ' ';
+    }
+
+    std::istringstream input(text);
+    std::vector<double> values;
+    double v = 0.0;
+    while (input >> v) values.push_back(v);
+    if (values.size() % 3 == 1 && values.front() >= 3.0) {
+        const double count = values.front();
+        const std::size_t pointCount = (values.size() - 1) / 3;
+        if (std::abs(count - static_cast<double>(pointCount)) < 1e-9) {
+            values.erase(values.begin());
+        }
+    }
+    if (values.size() < 9 || values.size() % 3 != 0) {
+        throw std::runtime_error("3D coordinate list must contain at least three x y z rows.");
+    }
+
+    std::vector<cki::link_pd_code::Point3> points;
+    points.reserve(values.size() / 3);
+    for (std::size_t i = 0; i < values.size(); i += 3) {
+        points.push_back(cki::link_pd_code::Point3{values[i], values[i + 1], values[i + 2]});
+    }
+    return points;
+}
+
+class Application {
+public:
+    Application(std::filesystem::path webRoot, KnotEngine& engine, TaskManager& tasks)
+        : webRoot_(std::move(webRoot)), engine_(engine), tasks_(tasks) {}
+
+    Response handle(const Request& request) {
+        const ClientSession session = clientSessionFromRequest(request);
+        Response response;
+        try {
+            if (request.method == "GET" && request.path == "/") {
+                response = serveFile(webRoot_, "index.html");
+            } else if (request.method == "GET" && request.path == "/tasks.html") {
+                response = serveFile(webRoot_, "tasks.html");
+            } else if (request.method == "GET" && startsWith(request.path, "/static/")) {
+                response = serveFile(webRoot_, request.path.substr(1));
+            } else if (request.method == "GET" && startsWith(request.path, "/img/")) {
+                response = serveFile(webRoot_ / "static" / "img", request.path.substr(5));
+            } else if (startsWith(request.path, "/api/")) {
+                response = handleApi(request, session.id);
+            } else {
+                response = makeText(404, "Not Found", "not found", "text/plain; charset=utf-8");
+            }
+        } catch (const std::exception& error) {
+            response = makeText(500, "Internal Server Error", error.what(), "text/plain; charset=utf-8");
+        }
+        attachClientCookie(response, session);
+        return response;
+    }
+
+    bool isWebSocketRequest(const Request& request) const {
+        if (request.method != "GET" || request.path != "/ws/tasks") return false;
+        const auto foundUpgrade = request.headers.find("upgrade");
+        if (foundUpgrade == request.headers.end() || lowerCopy(foundUpgrade->second) != "websocket") return false;
+        const auto foundConnection = request.headers.find("connection");
+        if (foundConnection == request.headers.end()) return false;
+        return lowerCopy(foundConnection->second).find("upgrade") != std::string::npos;
+    }
+
+    void handleWebSocket(const Request& request, Socket socket) {
+        const ClientSession session = clientSessionFromRequest(request);
+        const auto foundKey = request.headers.find("sec-websocket-key");
+        if (foundKey == request.headers.end() || trim(foundKey->second).empty()) {
+            sendAll(socket, makeText(400, "Bad Request", "missing WebSocket key", "text/plain; charset=utf-8").serialize());
+            return;
+        }
+
+        std::ostringstream handshake;
+        handshake << "HTTP/1.1 101 Switching Protocols\r\n"
+                  << "Upgrade: websocket\r\n"
+                  << "Connection: Upgrade\r\n"
+                  << "Sec-WebSocket-Accept: " << webSocketAcceptKey(trim(foundKey->second)) << "\r\n";
+        if (session.needsCookie) {
+            handshake << "Set-Cookie: " << clientCookieHeaderValue(session) << "\r\n";
+        }
+        handshake << "\r\n";
+        if (!sendAll(socket, handshake.str())) return;
+
+        while (!hki::interrupted()) {
+            if (!sendWebSocketText(socket, tasks_.toJson(session.id))) break;
+            for (int i = 0; i < 10 && !hki::interrupted(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+private:
+    std::filesystem::path webRoot_;
+    KnotEngine& engine_;
+    TaskManager& tasks_;
+
+    Response handleApi(const Request& request, const std::string& clientId) {
+        if (request.method == "GET" && request.path == "/api/tasks") {
+            return makeText(200, "OK", tasks_.toJson(clientId), "application/json; charset=utf-8");
+        }
+
+        if (request.method == "POST" && startsWith(request.path, "/api/tasks/") && endsWith(request.path, "/cancel")) {
+            const std::string idText = request.path.substr(std::string("/api/tasks/").size(),
+                                                           request.path.size() - std::string("/api/tasks/").size() - std::string("/cancel").size());
+            std::size_t used = 0;
+            const auto id = static_cast<std::uint64_t>(std::stoull(idText, &used, 10));
+            if (used != idText.size()) return makeJsonError("bad task id.");
+            std::string message;
+            return tasks_.cancel(id, message) ? makeJsonSuccess(message) : makeJsonError(message);
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/index_pd_code/")) {
+            const std::string rawPd = decodeApiPayload(request.path, "/api/index_pd_code/");
+            return runLookupTask(clientId, "PD Notation", rawPd, [&] {
+                return normalizePdInput(rawPd);
+            });
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/index_knot_name/")) {
+            const std::string knotName = decodeApiPayload(request.path, "/api/index_knot_name/");
+            return runLookupTask(clientId, "Knot Name", knotName, [&] {
+                std::string error;
+                const auto pd = engine_.lookupNamePd(knotName, error);
+                if (!pd.has_value()) throw std::runtime_error(error);
+                return normalizePdInput(*pd);
+            });
+        }
+
+        if (request.method == "POST" && request.path == "/api/index_coord_3d") {
+            const auto coordText = extractJsonString(request.body, "coord_3d");
+            if (!coordText.has_value()) return makeJsonError("coord_3d JSON string is required.");
+            return runLookupTask(clientId, "3D Coordinates", *coordText, [&] {
+                const auto points = parseCoordinateRows(*coordText);
+                const cki::link_pd_code::PDCode pd = cki::link_pd_code::computePDCode(points);
+                return normalizePdInput(cki::link_pd_code::formatPDCode(pd));
+            });
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/knot_name2pd_code/")) {
+            const std::string knotName = decodeApiPayload(request.path, "/api/knot_name2pd_code/");
+            std::string error;
+            const auto pd = engine_.lookupNamePd(knotName, error);
+            return pd.has_value() ? makeJsonSuccess(*pd) : makeJsonError(error);
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/pd_code2homflypt/")) {
+            const std::string pd = normalizePdInput(decodeApiPayload(request.path, "/api/pd_code2homflypt/"));
+            const LookupResult result = engine_.lookup(pd);
+            if (!result.homflyWorker.success) return makeJsonError(workerFailureMessage("HOMFLY-PT", result.homflyWorker));
+            return makeJsonSuccess(result.homfly);
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/pd_code2khovanov/")) {
+            const std::string pd = normalizePdInput(decodeApiPayload(request.path, "/api/pd_code2khovanov/"));
+            const LookupResult result = engine_.lookup(pd);
+            if (!result.khovanovWorker.success) return makeJsonError(workerFailureMessage("Khovanov", result.khovanovWorker));
+            return makeJsonSuccess(result.khovanov);
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/pd_code2knot_name/")) {
+            const std::string pd = normalizePdInput(decodeApiPayload(request.path, "/api/pd_code2knot_name/"));
+            const LookupResult result = engine_.lookup(pd);
+            if (!result.candidateError.empty()) return makeJsonError(result.candidateError);
+            return makeJsonSuccess(join(result.candidates, "; "));
+        }
+
+        if (request.method == "POST" && request.path == "/api/coord_3d2pd_code") {
+            const auto coordText = extractJsonString(request.body, "coord_3d");
+            if (!coordText.has_value()) return makeJsonError("coord_3d JSON string is required.");
+            const auto points = parseCoordinateRows(*coordText);
+            const cki::link_pd_code::PDCode pd = cki::link_pd_code::computePDCode(points);
+            return makeJsonSuccess(cki::link_pd_code::formatPDCode(pd));
+        }
+
+        if (request.method == "GET" && request.path == "/api/last_build_info") {
+            std::ostringstream info;
+            info << "Pure C++ knot-indexer-lab server\n"
+                 << "Invariant timeout: " << kMaxComputeTimeoutSeconds << " seconds\n"
+                 << "PD_m data: " << engine_.nameIndexStatus() << "\n";
+            return makeText(200, "OK", info.str(), "text/plain; charset=utf-8");
+        }
+
+        return makeText(404, "Not Found", "not found", "text/plain; charset=utf-8");
+    }
+
+    template <typename ResolvePd>
+    Response runLookupTask(const std::string& clientId, const std::string& inputType, const std::string& input, ResolvePd resolvePd) {
+        auto task = tasks_.create(clientId, inputType, input);
+        try {
+            const std::string pd = resolvePd();
+            tasks_.setCanonicalPd(task, pd);
+            const LookupResult result = engine_.lookup(pd, task->cancellation);
+            tasks_.complete(task, result);
+            return makeLookupJson(task, result);
+        } catch (const std::exception& error) {
+            tasks_.fail(task, error.what());
+            return makeTaskFailureJson(task, error.what());
+        }
+    }
+
+    Response makeLookupJson(const TaskManager::TaskPtr& task, const LookupResult& result) const {
+        const bool cancelled = result.homflyWorker.cancelled || result.khovanovWorker.cancelled;
+        const bool useful = result.homflyWorker.success || result.khovanovWorker.success || !result.candidates.empty();
+        const std::string status = (!cancelled && useful) ? "success" : "error";
+        std::string message;
+        if (cancelled) {
+            message = "task was cancelled.";
+        } else if (!useful) {
+            message = "no invariant computation completed successfully.";
+        } else if (!result.candidateError.empty()) {
+            message = result.candidateError;
+        }
+
+        std::ostringstream out;
+        out << "{"
+            << "\"status\":\"" << status << "\","
+            << "\"message\":\"" << jsonEscape(message) << "\","
+            << "\"task_id\":" << (task ? task->id : 0) << ","
+            << "\"pd_code\":\"" << jsonEscape(result.canonicalPd) << "\","
+            << "\"knot_name\":\"" << jsonEscape(join(result.candidates, "; ")) << "\","
+            << "\"homfly_status\":\"" << jsonEscape(workerStatusText(result.homflyWorker)) << "\","
+            << "\"homflypt_polynomial\":\"" << jsonEscape(result.homfly) << "\","
+            << "\"homfly_error\":\"" << jsonEscape(result.homflyWorker.success ? "" : workerFailureMessage("HOMFLY-PT", result.homflyWorker)) << "\","
+            << "\"khovanov_status\":\"" << jsonEscape(workerStatusText(result.khovanovWorker)) << "\","
+            << "\"khovanov_homology\":\"" << jsonEscape(result.khovanov) << "\","
+            << "\"khovanov_error\":\"" << jsonEscape(result.khovanovWorker.success ? "" : workerFailureMessage("Khovanov", result.khovanovWorker)) << "\""
+            << "}";
+        return makeText(200, "OK", out.str(), "application/json; charset=utf-8");
+    }
+
+    Response makeTaskFailureJson(const TaskManager::TaskPtr& task, const std::string& error) const {
+        std::ostringstream out;
+        out << "{"
+            << "\"status\":\"error\","
+            << "\"message\":\"" << jsonEscape(error) << "\","
+            << "\"task_id\":" << (task ? task->id : 0)
+            << "}";
+        return makeText(200, "OK", out.str(), "application/json; charset=utf-8");
+    }
+};
+
+class HttpServer {
+public:
+    HttpServer(std::string host, int port, Application& app)
+        : host_(std::move(host)), port_(port), app_(app) {}
+
+    void run() {
+        SocketRuntime runtime;
+        Socket server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (server == kInvalidSocket) throw std::runtime_error("cannot create server socket");
+
+        int yes = 1;
+#ifdef _WIN32
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(static_cast<unsigned short>(port_));
+        if (inet_pton(AF_INET, host_.c_str(), &address.sin_addr) != 1) {
+            closeSocket(server);
+            throw std::runtime_error("invalid IPv4 host: " + host_);
+        }
+
+        if (bind(server, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+            closeSocket(server);
+            throw std::runtime_error("cannot bind to " + host_ + ":" + std::to_string(port_));
+        }
+        if (listen(server, 64) != 0) {
+            closeSocket(server);
+            throw std::runtime_error("cannot listen on server socket");
+        }
+
+        const std::string displayHost = host_ == "0.0.0.0" ? "127.0.0.1" : host_;
+        std::cerr << "knot-indexer-lab listening on http://" << displayHost << ":" << port_ << "\n";
+        while (!hki::interrupted()) {
+            sockaddr_in clientAddress{};
+#ifdef _WIN32
+            int clientLength = sizeof(clientAddress);
+#else
+            socklen_t clientLength = sizeof(clientAddress);
+#endif
+            Socket client = accept(server, reinterpret_cast<sockaddr*>(&clientAddress), &clientLength);
+            if (client == kInvalidSocket) {
+                if (hki::interrupted()) break;
+                continue;
+            }
+            std::thread(&HttpServer::handleClient, this, client).detach();
+        }
+        closeSocket(server);
+    }
+
+private:
+    std::string host_;
+    int port_ = kDefaultPort;
+    Application& app_;
+
+    void handleClient(Socket client) {
+        try {
+            const auto request = readRequest(client);
+            if (request.has_value()) {
+                if (app_.isWebSocketRequest(*request)) {
+                    app_.handleWebSocket(*request, client);
+                } else {
+                    const Response response = app_.handle(*request);
+                    sendAll(client, response.serialize());
+                }
+            }
+        } catch (const std::exception& error) {
+            const Response response = makeText(400, "Bad Request", error.what(), "text/plain; charset=utf-8");
+            sendAll(client, response.serialize());
+        }
+        closeSocket(client);
+    }
+};
+
+void usage(std::ostream& out) {
+    out << "Usage: knot_indexer_lab_server [OPTIONS]\n\n"
+        << "Options:\n"
+        << "  --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0\n"
+        << "  --port PORT          TCP port. Default: 5000\n"
+        << "  --data-folder PATH   Folder containing name-pd/PD_m_3-16.sorted.txt and knotname-reg/.\n"
+        << "  --web-root PATH      Folder containing index.html and static/.\n"
+        << "  --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200\n"
+        << "  --build-sqlite       Import PD_m_3-16.sorted.txt into PD_m_3-16.sqlite, then exit.\n"
+        << "  --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit.\n"
+        << "  --index-limit N      Limit newly imported or indexed records in build modes.\n"
+        << "  --help, -h           Show this help text.\n";
+}
+
+int parsePositiveInt(const std::string& value, const std::string& name) {
+    std::size_t used = 0;
+    int parsed = 0;
+    try {
+        parsed = std::stoi(value, &used, 10);
+    } catch (const std::exception&) {
+        throw std::runtime_error(name + " must be an integer");
+    }
+    if (used != value.size() || parsed <= 0) throw std::runtime_error(name + " must be positive");
+    return parsed;
+}
+
+Options parseOptions(int argc, char** argv) {
+    Options options;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto needValue = [&](const char* name) -> std::string {
+            if (++i >= argc) throw std::runtime_error(std::string(name) + " needs a value");
+            return argv[i];
+        };
+
+        if (arg == "--help" || arg == "-h") {
+            usage(std::cout);
+            std::exit(0);
+        } else if (arg == "--host") {
+            options.host = needValue("--host");
+        } else if (arg == "--port") {
+            options.port = parsePositiveInt(needValue("--port"), "--port");
+        } else if (arg == "--data-folder") {
+            options.dataFolder = needValue("--data-folder");
+        } else if (arg == "--web-root") {
+            options.webRoot = needValue("--web-root");
+        } else if (arg == "--timeout") {
+            options.timeoutSeconds = parsePositiveInt(needValue("--timeout"), "--timeout");
+            if (options.timeoutSeconds > kMaxComputeTimeoutSeconds) {
+                throw std::runtime_error("--timeout must not exceed 1200 seconds");
+            }
+        } else if (arg == "--build-sqlite") {
+            options.buildSqlite = true;
+        } else if (arg == "--build-pd-index") {
+            options.buildPdIndex = true;
+        } else if (arg == "--index-limit") {
+            options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit"), "--index-limit"));
+        } else if (arg == "--worker") {
+            return options;
+        } else {
+            throw std::runtime_error("unknown option: " + arg);
+        }
+    }
+    return options;
+}
+
+}  // namespace
+}  // namespace lab
+
+int main(int argc, char** argv) {
+    try {
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--worker") {
+                hki::installInterruptHandlers();
+                return lab::workerMain(argc, argv);
+            }
+        }
+
+        hki::installInterruptHandlers();
+        const lab::Options options = lab::parseOptions(argc, argv);
+        const std::filesystem::path executable = lab::currentExecutablePath(argv[0]);
+        const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
+        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, !options.buildSqlite);
+        if (options.buildSqlite) {
+            engine.buildSqliteNameDatabase(options.indexLimit);
+            return 0;
+        }
+        if (options.buildPdIndex) {
+            engine.buildPdInvariantIndex(options.indexLimit);
+            return 0;
+        }
+
+        const std::filesystem::path webRoot = lab::resolveWebRoot(executable, options.webRoot);
+        lab::TaskManager tasks;
+        lab::Application app(webRoot, engine, tasks);
+        lab::HttpServer server(options.host, options.port, app);
+        server.run();
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "ERROR: " << error.what() << "\n";
+        return 1;
+    }
+}

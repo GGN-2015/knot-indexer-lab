@@ -1,0 +1,134 @@
+#include "che_to_coord.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+
+namespace {
+
+std::string readAll(std::istream& input) {
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+
+std::string readTextFile(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw cki::che_to_coord::ParseError("cannot open input file: " + path.string());
+    }
+    return readAll(input);
+}
+
+void writeTextFile(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream output(path);
+    if (!output) {
+        throw cki::che_to_coord::ParseError("cannot open output file: " + path.string());
+    }
+    output << text;
+}
+
+std::string formatForLinkPDCode(const cki::che_to_coord::CoordinateLoop& loop) {
+    std::ostringstream output;
+    output.precision(17);
+    output << "1\n" << loop.size() << '\n';
+    for (const cki::che_to_coord::OrderedPoint& point : loop) {
+        output << point.position.x << ' '
+               << point.position.y << ' '
+               << point.position.z << '\n';
+    }
+    return output.str();
+}
+
+void printUsage(std::ostream& output) {
+    output
+        << "Usage: che_to_coord [OPTIONS] [INPUT]\n"
+        << "\n"
+        << "Read a molecule data file with Atoms and Bonds sections and write an ordered 3D loop.\n"
+        << "If INPUT and --input are omitted, input is read from stdin.\n"
+        << "\n"
+        << "Options:\n"
+        << "  --input, -i PATH        Read molecule data from PATH.\n"
+        << "  --output, -o PATH       Write output to PATH instead of stdout.\n"
+        << "  --format FORMAT         Output format: link or atom-id. Default: link.\n"
+        << "  --no-prefer-atom-one    Start from the lowest atom id instead of atom 1.\n"
+        << "  --help, -h              Show this help text.\n";
+}
+
+std::string requireValue(int& index, int argc, char** argv, const std::string& option) {
+    if (index + 1 >= argc) {
+        throw cki::che_to_coord::ParseError(option + " requires a value");
+    }
+    ++index;
+    return argv[index];
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    std::filesystem::path input_path;
+    std::filesystem::path output_path;
+    bool have_input = false;
+    bool have_output = false;
+    std::string format = "link";
+    cki::che_to_coord::ParseOptions options;
+
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--help" || arg == "-h") {
+                printUsage(std::cout);
+                return 0;
+            }
+            if (arg == "--input" || arg == "-i") {
+                input_path = requireValue(i, argc, argv, arg);
+                have_input = true;
+                continue;
+            }
+            if (arg == "--output" || arg == "-o") {
+                output_path = requireValue(i, argc, argv, arg);
+                have_output = true;
+                continue;
+            }
+            if (arg == "--format") {
+                format = requireValue(i, argc, argv, arg);
+                if (format != "link" && format != "atom-id") {
+                    throw cki::che_to_coord::ParseError("--format must be 'link' or 'atom-id'");
+                }
+                continue;
+            }
+            if (arg == "--no-prefer-atom-one") {
+                options.prefer_atom_one_start = false;
+                continue;
+            }
+            if (!arg.empty() && arg[0] == '-') {
+                throw cki::che_to_coord::ParseError("unknown option: " + arg);
+            }
+            if (have_input) {
+                throw cki::che_to_coord::ParseError("multiple input paths were provided");
+            }
+            input_path = arg;
+            have_input = true;
+        }
+
+        const std::string text = have_input ? readTextFile(input_path) : readAll(std::cin);
+        const cki::che_to_coord::CoordinateLoop loop =
+            cki::che_to_coord::parseCoordinateLoopText(text, options);
+        const std::string rendered =
+            format == "link" ? formatForLinkPDCode(loop) : cki::che_to_coord::formatCoordinateLoop(loop);
+
+        if (have_output) {
+            writeTextFile(output_path, rendered);
+        } else {
+            std::cout << rendered;
+        }
+        return 0;
+    } catch (const cki::che_to_coord::ParseError& error) {
+        std::cerr << "ERROR: " << error.what() << '\n';
+    } catch (const std::exception& error) {
+        std::cerr << "ERROR: " << error.what() << '\n';
+    }
+    return 1;
+}
