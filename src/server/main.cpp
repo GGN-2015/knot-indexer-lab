@@ -1172,6 +1172,13 @@ std::string sqliteError(sqlite3* db) {
     return db ? sqlite3_errmsg(db) : "sqlite handle is null";
 }
 
+bool isCorruptSqliteMessage(const std::string& message) {
+    const std::string lower = lowerCopy(message);
+    return lower.find("database disk image is malformed") != std::string::npos ||
+           lower.find("file is not a database") != std::string::npos ||
+           lower.find("malformed") != std::string::npos;
+}
+
 class SqliteStatement {
 public:
     SqliteStatement(sqlite3* db, const std::string& sql) : db_(db) {
@@ -1363,7 +1370,10 @@ public:
             }
             execNoLock("COMMIT");
         } catch (...) {
-            execNoLock("ROLLBACK");
+            try {
+                execNoLock("ROLLBACK");
+            } catch (const std::exception&) {
+            }
             throw;
         }
         invariantRecordCount_ += written;
@@ -1371,56 +1381,15 @@ public:
     }
 
     std::size_t importNamePdText(const std::filesystem::path& textFile, std::size_t limit) {
-        if (!existsPath(textFile)) {
-            throw std::runtime_error("PD_m text database not found at " + cki::platform::displayPath(textFile) + ".");
-        }
-        std::ifstream input(textFile, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot open PD_m text database at " + cki::platform::displayPath(textFile) + ".");
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        openWritableIfNeeded();
-        configureBulkImportNoLock();
-        ensureSchemaNoLock();
-        execNoLock("BEGIN IMMEDIATE");
-
-        std::size_t imported = 0;
-        std::size_t seen = 0;
         try {
-            SqliteStatement stmt(db_, "INSERT OR IGNORE INTO pd_records(name, pd) VALUES (?, ?)");
-            std::string line;
-            while (std::getline(input, line)) {
-                if (limit > 0 && imported >= limit) break;
-                std::string name;
-                std::string pd;
-                if (!parseNamePdRecord(line, name, pd)) continue;
-                name = names_.normalize(name);
-                if (name.empty()) continue;
-
-                stmt.bindText(1, name);
-                stmt.bindText(2, pd);
-                stmt.stepDone();
-                imported += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
-                stmt.reset();
-                ++seen;
-
-                if (seen % 50000 == 0) {
-                    execNoLock("COMMIT");
-                    std::cerr << "SQLite import progress: read " << seen << " rows, inserted "
-                              << imported << " canonical rows.\n";
-                    execNoLock("BEGIN IMMEDIATE");
-                }
-            }
-        execNoLock("COMMIT");
-        } catch (...) {
-            execNoLock("ROLLBACK");
-            throw;
+            return importNamePdTextOnce(textFile, limit);
+        } catch (const std::exception& error) {
+            if (!isCorruptSqliteMessage(error.what())) throw;
+            std::cerr << "warning: SQLite database at " << file_
+                      << " is malformed; deleting it and rebuilding from PD_m text data.\n";
+            removeDatabaseFilesForRebuild();
+            return importNamePdTextOnce(textFile, limit);
         }
-
-        ensureIndexesNoLock();
-        refreshCountsNoLock();
-        std::cerr << "SQLite PD_m import complete: inserted " << imported
-                  << " canonical rows into " << file_ << ".\n";
-        return imported;
     }
 
     void beginInvariantBulkBuild() {
@@ -1565,6 +1534,92 @@ private:
     std::size_t pdRecordCount_ = 0;
     std::size_t invariantRecordCount_ = 0;
     std::string statusMessage_;
+
+    std::size_t importNamePdTextOnce(const std::filesystem::path& textFile, std::size_t limit) {
+        if (!existsPath(textFile)) {
+            throw std::runtime_error("PD_m text database not found at " + cki::platform::displayPath(textFile) + ".");
+        }
+        std::ifstream input(textFile, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot open PD_m text database at " + cki::platform::displayPath(textFile) + ".");
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        openWritableIfNeeded();
+        configureBulkImportNoLock();
+        ensureSchemaNoLock();
+        execNoLock("BEGIN IMMEDIATE");
+
+        std::size_t imported = 0;
+        std::size_t seen = 0;
+        try {
+            SqliteStatement stmt(db_, "INSERT OR IGNORE INTO pd_records(name, pd) VALUES (?, ?)");
+            std::string line;
+            while (std::getline(input, line)) {
+                if (limit > 0 && imported >= limit) break;
+                std::string name;
+                std::string pd;
+                if (!parseNamePdRecord(line, name, pd)) continue;
+                name = names_.normalize(name);
+                if (name.empty()) continue;
+
+                stmt.bindText(1, name);
+                stmt.bindText(2, pd);
+                stmt.stepDone();
+                imported += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
+                stmt.reset();
+                ++seen;
+
+                if (seen % 50000 == 0) {
+                    execNoLock("COMMIT");
+                    std::cerr << "SQLite import progress: read " << seen << " rows, inserted "
+                              << imported << " canonical rows.\n";
+                    execNoLock("BEGIN IMMEDIATE");
+                }
+            }
+        execNoLock("COMMIT");
+        } catch (...) {
+            try {
+                execNoLock("ROLLBACK");
+            } catch (const std::exception&) {
+            }
+            throw;
+        }
+
+        ensureIndexesNoLock();
+        refreshCountsNoLock();
+        std::cerr << "SQLite PD_m import complete: inserted " << imported
+                  << " canonical rows into " << file_ << ".\n";
+        return imported;
+    }
+
+    void removeDatabaseFilesForRebuild() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        close();
+
+        std::vector<std::filesystem::path> files;
+        files.push_back(file_);
+        std::filesystem::path wal = file_;
+        wal += "-wal";
+        files.push_back(wal);
+        std::filesystem::path shm = file_;
+        shm += "-shm";
+        files.push_back(shm);
+        std::filesystem::path journal = file_;
+        journal += "-journal";
+        files.push_back(journal);
+
+        for (const std::filesystem::path& path : files) {
+            std::error_code ec;
+            if (!std::filesystem::exists(path, ec)) continue;
+            ec.clear();
+            std::filesystem::remove(path, ec);
+            if (ec) {
+                throw std::runtime_error("cannot delete malformed SQLite file " +
+                                         cki::platform::displayPath(path) + ": " + ec.message());
+            }
+        }
+
+        statusMessage_.clear();
+    }
 
     void close() {
         if (db_) {
@@ -3251,7 +3306,6 @@ int main(int argc, char** argv) {
         lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing, !options.buildSqlite);
         if (options.buildSqlite) {
             engine.buildSqliteNameDatabase(options.indexLimit);
-            return 0;
         }
         if (options.buildPdIndex) {
             engine.buildPdInvariantIndex(options.indexLimit,
@@ -3260,6 +3314,7 @@ int main(int argc, char** argv) {
                                          options.indexProgressSeconds);
             return 0;
         }
+        if (options.buildSqlite) return 0;
 
         const std::filesystem::path webRoot = lab::resolveWebRoot(executable, options.webRoot);
         lab::TaskManager tasks;

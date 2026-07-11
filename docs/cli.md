@@ -102,6 +102,10 @@ Import the text name-to-PD database into SQLite:
 build/knot_indexer_lab_server --build-sqlite
 ```
 
+If the existing SQLite file is malformed, `--build-sqlite` deletes the broken
+database and its WAL/SHM sidecar files, then rebuilds it from the text PD_m
+data.
+
 Build or extend the invariant index:
 
 ```sh
@@ -127,6 +131,9 @@ build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-s
 Each index worker launches HOMFLY-PT and Khovanov workers for the input PD
 code. The batch index builder does not run PD simplification, so set
 `--index-workers` according to available CPU and memory.
+
+You can pass `--build-sqlite` and `--build-pd-index` together to rebuild the
+SQLite name database first and then continue into invariant indexing.
 
 ## Windows Notes
 

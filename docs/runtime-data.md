@@ -40,6 +40,10 @@ data/name-pd/PD_m_3-16.sqlite
 The server prefers SQLite when it exists. Without SQLite, it falls back to a
 streaming text-file index.
 
+If the existing SQLite database is malformed, `--build-sqlite` automatically
+closes it, deletes the `.sqlite` file plus `-wal`, `-shm`, and `-journal`
+sidecar files, and rebuilds from `PD_m_3-16.sorted.txt`.
+
 ## Invariant Index
 
 Candidate lookup by PD code uses generated invariant records:
@@ -47,6 +51,9 @@ Candidate lookup by PD code uses generated invariant records:
 ```sh
 build/knot_indexer_lab_server --build-pd-index
 ```
+
+When `--build-sqlite` and `--build-pd-index` are used together, the SQLite
+name database is imported or rebuilt first, then invariant indexing starts.
 
 When `PD_m_3-16.sqlite` is present, invariant records are written into its
 `invariants` table. Otherwise, the fallback writer creates:
