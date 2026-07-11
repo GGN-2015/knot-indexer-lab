@@ -39,6 +39,8 @@ The SQLite invariant builder is optimized for large PD_m data:
 
 - one producer pages unindexed records from SQLite
 - multiple compute workers run invariant calculations in parallel
+- batch workers compute directly from the stored PD_m PD code and do not run
+  PD simplification
 - one writer batches successful rows into SQLite transactions
 - progress output includes processed rows, written rows, failures, rate,
   elapsed time, and `ETA HH:MM:SS`

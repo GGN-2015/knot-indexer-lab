@@ -1891,7 +1891,7 @@ public:
 
             std::cerr << "indexing " << record.name << " (" << (built + 1) << " built so far)\n";
             try {
-                LookupResult result = computeInvariants(*canonicalPd, nullptr);
+                LookupResult result = computeInvariants(*canonicalPd, nullptr, InvariantPipelineMode::OriginalOnly);
                 if (result.homflyWorker.success && result.khovanovWorker.success) {
                     invariantIndex_.append(record.name, *canonicalPd, result.homfly, result.khovanov);
                     ++built;
@@ -2106,7 +2106,10 @@ private:
                                 work.status = IndexWorkStatus::Skipped;
                                 work.error = "invalid PD code";
                             } else {
-                                LookupResult result = computeInvariants(*canonicalPd, cancellation);
+                                LookupResult result = computeInvariants(
+                                    *canonicalPd,
+                                    cancellation,
+                                    InvariantPipelineMode::OriginalOnly);
                                 if (result.homflyWorker.success && result.khovanovWorker.success) {
                                     work.status = IndexWorkStatus::Success;
                                     work.invariant = PdSqliteStore::InvariantRecord{
@@ -2225,6 +2228,11 @@ private:
         Khovanov,
     };
 
+    enum class InvariantPipelineMode {
+        OriginalOnly,
+        SimplifyRetry,
+    };
+
     struct RunningAttempt {
         InvariantKind kind;
         std::string source;
@@ -2287,7 +2295,8 @@ private:
     }
 
     LookupResult computeInvariants(const std::string& canonicalPd,
-                                   const std::shared_ptr<hki::CancellationToken>& cancellation) {
+                                   const std::shared_ptr<hki::CancellationToken>& cancellation,
+                                   InvariantPipelineMode mode) {
         const auto deadline = timeoutSeconds_ > 0
             ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds_)
             : std::chrono::steady_clock::time_point::max();
@@ -2312,11 +2321,12 @@ private:
         startInvariant(InvariantKind::Homfly, "original", canonicalPd);
         startInvariant(InvariantKind::Khovanov, "original", canonicalPd);
 
+        const bool allowSimplifyRetry = mode == InvariantPipelineMode::SimplifyRetry;
         std::unique_ptr<hki::WorkerProcess> simplify =
-            hki::startWorkerProcess(executable_, "simplify", canonicalPd);
+            allowSimplifyRetry ? hki::startWorkerProcess(executable_, "simplify", canonicalPd) : nullptr;
         hki::WorkerResult simplifyResult;
         std::string simplifiedPd;
-        bool simplifyFinished = false;
+        bool simplifyFinished = !allowSimplifyRetry;
         bool simplifiedAttemptsStarted = false;
 
         auto maybeStartSimplifiedAttempts = [&]() {
@@ -2427,7 +2437,7 @@ private:
 
     LookupResult compute(const std::string& canonicalPd,
                          const std::shared_ptr<hki::CancellationToken>& cancellation) {
-        LookupResult result = computeInvariants(canonicalPd, cancellation);
+        LookupResult result = computeInvariants(canonicalPd, cancellation, InvariantPipelineMode::SimplifyRetry);
 
         std::optional<std::string> homfly;
         std::optional<std::string> khovanov;

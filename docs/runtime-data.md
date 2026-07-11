@@ -60,6 +60,10 @@ unindexed records through a bounded work queue, computes HOMFLY-PT and Khovanov
 in multiple worker lanes, writes successful rows in SQLite transactions, and
 prints periodic progress with `ETA HH:MM:SS`.
 
+The batch index builder computes invariants directly from the stored PD_m PD
+code. It does not run PD simplification because the PD_m records are expected
+to be already minimized for this build stage.
+
 Useful tuning options:
 
 ```sh

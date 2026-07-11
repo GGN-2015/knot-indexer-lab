@@ -119,8 +119,9 @@ Tune a large SQLite invariant build:
 build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
 ```
 
-Each index worker can launch several child processes for the invariant
-pipeline, so set `--index-workers` according to available CPU and memory.
+Each index worker launches HOMFLY-PT and Khovanov workers for the input PD
+code. The batch index builder does not run PD simplification, so set
+`--index-workers` according to available CPU and memory.
 
 ## Windows Notes
 
