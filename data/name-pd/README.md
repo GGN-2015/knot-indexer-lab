@@ -33,6 +33,14 @@ exists. Generate or extend those records with:
 build/knot_indexer_lab_server --build-pd-index
 ```
 
+SQLite invariant indexing uses parallel compute workers, batched SQLite
+transactions, and periodic progress output with `ETA HH:MM:SS`. Tune large
+builds with:
+
+```sh
+build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
+```
+
 If SQLite is not present, `--build-pd-index` writes the fallback TSV file:
 
 ```text

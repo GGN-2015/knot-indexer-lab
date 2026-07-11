@@ -89,6 +89,10 @@ Server options:
 --build-sqlite       Import PD_m_3-16.sorted.txt into SQLite, then exit
 --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit
 --index-limit N      Limit newly imported or indexed records in build modes
+--index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores
+--index-batch-size N SQLite invariant rows per write transaction. Default: 256
+--index-progress-seconds N
+                     Progress/ETA refresh interval. Default: 5
 ```
 
 ## Runtime Data
@@ -146,6 +150,20 @@ For smoke tests or batched generation, use:
 ```sh
 build/knot_indexer_lab_server --build-pd-index --index-limit 100
 ```
+
+SQLite invariant builds are parallel by default. The builder streams unindexed
+records through a bounded work queue, computes HOMFLY-PT and Khovanov in
+multiple worker lanes, writes successful rows in SQLite transactions, and prints
+periodic progress with `ETA HH:MM:SS`.
+
+Useful tuning options:
+
+```sh
+build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
+```
+
+Each build worker can launch several child processes for the invariant
+pipeline, so set `--index-workers` according to available CPU and memory.
 
 When `PD_m_3-16.sqlite` is present, invariant records are written into its
 `invariants` table. Otherwise, the fallback writer creates

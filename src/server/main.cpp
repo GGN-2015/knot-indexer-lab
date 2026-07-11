@@ -26,12 +26,16 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <ctime>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -87,6 +91,9 @@ struct Options {
     bool buildSqlite = false;
     bool buildPdIndex = false;
     std::size_t indexLimit = 0;
+    std::size_t indexWorkers = 0;
+    std::size_t indexBatchSize = 256;
+    int indexProgressSeconds = 5;
     std::filesystem::path dataFolder;
     std::filesystem::path webRoot;
 };
@@ -136,6 +143,83 @@ struct LookupResult {
     hki::WorkerResult homflyWorker;
     hki::WorkerResult khovanovWorker;
 };
+
+template <typename T>
+class BlockingQueue {
+public:
+    explicit BlockingQueue(std::size_t capacity) : capacity_(std::max<std::size_t>(1, capacity)) {}
+
+    bool push(T item, const std::atomic_bool& stopRequested) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+            return closed_ || stopRequested.load() || items_.size() < capacity_;
+        });
+        if (closed_ || stopRequested.load()) return false;
+        items_.push_back(std::move(item));
+        cv_.notify_all();
+        return true;
+    }
+
+    bool pop(T& item, const std::atomic_bool& stopRequested) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+            return closed_ || stopRequested.load() || !items_.empty();
+        });
+        if (items_.empty()) return false;
+        item = std::move(items_.front());
+        items_.pop_front();
+        cv_.notify_all();
+        return true;
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::size_t capacity_;
+    std::deque<T> items_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool closed_ = false;
+};
+
+struct IndexBuildStats {
+    std::atomic<std::size_t> queued{0};
+    std::atomic<std::size_t> processed{0};
+    std::atomic<std::size_t> succeeded{0};
+    std::atomic<std::size_t> written{0};
+    std::atomic<std::size_t> skipped{0};
+    std::atomic<std::size_t> failed{0};
+};
+
+struct IndexBuildResult {
+    std::size_t written = 0;
+    std::size_t skipped = 0;
+    std::size_t failed = 0;
+    std::size_t totalTarget = 0;
+};
+
+std::string formatDurationHms(std::uint64_t totalSeconds) {
+    const std::uint64_t hours = totalSeconds / 3600;
+    const std::uint64_t minutes = (totalSeconds / 60) % 60;
+    const std::uint64_t seconds = totalSeconds % 60;
+    std::ostringstream out;
+    out << std::setfill('0') << std::setw(2) << hours
+        << ":" << std::setw(2) << minutes
+        << ":" << std::setw(2) << seconds;
+    return out.str();
+}
+
+std::string formatRate(double value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(value >= 100.0 ? 1 : 2) << value;
+    return out.str();
+}
 
 bool startsWith(const std::string& value, const std::string& prefix) {
     return value.size() >= prefix.size() &&
@@ -1056,6 +1140,12 @@ public:
         }
     }
 
+    void bindInt64(int index, sqlite3_int64 value) {
+        if (sqlite3_bind_int64(stmt_, index, value) != SQLITE_OK) {
+            throw std::runtime_error("sqlite bind failed: " + sqliteError(db_));
+        }
+    }
+
     int step() {
         const int rc = sqlite3_step(stmt_);
         if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
@@ -1093,6 +1183,13 @@ public:
     struct Record {
         std::string name;
         std::string pd;
+    };
+
+    struct InvariantRecord {
+        std::string name;
+        std::string canonicalPd;
+        std::string homfly;
+        std::string khovanov;
     };
 
     PdSqliteStore(std::filesystem::path file, const NameCanonicalizer& names)
@@ -1185,22 +1282,39 @@ public:
                          const std::string& canonicalPd,
                          const std::string& homfly,
                          const std::string& khovanov) {
-        const std::string name = names_.normalize(rawName);
-        if (name.empty() || canonicalPd.empty() || homfly.empty() || khovanov.empty()) return;
+        appendInvariantBatch({InvariantRecord{rawName, canonicalPd, homfly, khovanov}});
+    }
 
+    std::size_t appendInvariantBatch(const std::vector<InvariantRecord>& records) {
+        if (records.empty()) return 0;
         std::lock_guard<std::mutex> lock(mutex_);
         openWritableIfNeeded();
         ensureSchemaNoLock();
-        ensureIndexesNoLock();
-        SqliteStatement stmt(
-            db_,
-            "INSERT OR REPLACE INTO invariants(name, canonical_pd, homfly, khovanov) VALUES (?, ?, ?, ?)");
-        stmt.bindText(1, name);
-        stmt.bindText(2, canonicalPd);
-        stmt.bindText(3, homfly);
-        stmt.bindText(4, khovanov);
-        stmt.stepDone();
-        ++invariantRecordCount_;
+
+        std::size_t written = 0;
+        execNoLock("BEGIN IMMEDIATE");
+        try {
+            SqliteStatement stmt(
+                db_,
+                "INSERT OR REPLACE INTO invariants(name, canonical_pd, homfly, khovanov) VALUES (?, ?, ?, ?)");
+            for (const InvariantRecord& record : records) {
+                const std::string name = names_.normalize(record.name);
+                if (name.empty() || record.canonicalPd.empty() || record.homfly.empty() || record.khovanov.empty()) continue;
+                stmt.bindText(1, name);
+                stmt.bindText(2, record.canonicalPd);
+                stmt.bindText(3, record.homfly);
+                stmt.bindText(4, record.khovanov);
+                stmt.stepDone();
+                written += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
+                stmt.reset();
+            }
+            execNoLock("COMMIT");
+        } catch (...) {
+            execNoLock("ROLLBACK");
+            throw;
+        }
+        invariantRecordCount_ += written;
+        return written;
     }
 
     std::size_t importNamePdText(const std::filesystem::path& textFile, std::size_t limit) {
@@ -1254,6 +1368,67 @@ public:
         std::cerr << "SQLite PD_m import complete: inserted " << imported
                   << " canonical rows into " << file_ << ".\n";
         return imported;
+    }
+
+    void beginInvariantBulkBuild() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        openWritableIfNeeded();
+        execNoLock("PRAGMA journal_mode=WAL");
+        execNoLock("PRAGMA synchronous=NORMAL");
+        execNoLock("PRAGMA temp_store=MEMORY");
+        execNoLock("PRAGMA cache_size=-262144");
+        ensureSchemaNoLock();
+        execNoLock("DROP INDEX IF EXISTS idx_invariants_homfly");
+        execNoLock("DROP INDEX IF EXISTS idx_invariants_khovanov");
+        execNoLock("DROP INDEX IF EXISTS idx_invariants_pair");
+        refreshCountsNoLock();
+    }
+
+    void finishInvariantBulkBuild() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+        ensureIndexesNoLock();
+        execNoLock("PRAGMA optimize");
+        refreshCountsNoLock();
+    }
+
+    std::size_t countUnindexedRecords() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!db_) return 0;
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+        SqliteStatement stmt(
+            db_,
+            "SELECT COUNT(*) "
+            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
+            "WHERE i.name IS NULL");
+        if (stmt.step() != SQLITE_ROW) return 0;
+        return stmt.columnSize(0);
+    }
+
+    std::vector<Record> fetchUnindexedRecordsAfter(const std::string& lastName, std::size_t limit) {
+        if (limit == 0) return {};
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!db_) return {};
+        openWritableIfNeeded();
+        ensureSchemaNoLock();
+
+        SqliteStatement stmt(
+            db_,
+            "SELECT p.name, p.pd "
+            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
+            "WHERE i.name IS NULL AND (?1 = '' OR p.name > ?1) "
+            "ORDER BY p.name LIMIT ?2");
+        stmt.bindText(1, lastName);
+        stmt.bindInt64(2, static_cast<sqlite3_int64>(limit));
+
+        std::vector<Record> records;
+        records.reserve(limit);
+        while (stmt.step() == SQLITE_ROW) {
+            records.push_back(Record{stmt.columnText(0), stmt.columnText(1)});
+        }
+        return records;
     }
 
     template <typename Callback>
@@ -1688,9 +1863,12 @@ public:
         return sqliteStore_.importNamePdText(dataPaths_.namePdFile, limit);
     }
 
-    std::size_t buildPdInvariantIndex(std::size_t limit) {
+    std::size_t buildPdInvariantIndex(std::size_t limit,
+                                      std::size_t workers,
+                                      std::size_t batchSize,
+                                      int progressSeconds) {
         if (sqliteStore_.hasPdRecords()) {
-            return buildSqliteInvariantIndex(limit);
+            return buildSqliteInvariantIndex(limit, workers, batchSize, progressSeconds).written;
         }
         if (!pdRecords_.loaded()) {
             throw std::runtime_error("PD_m_3-16.sorted.txt is required before building the invariant index.");
@@ -1752,46 +1930,276 @@ private:
     std::mutex cacheMutex_;
     std::unordered_map<std::string, LookupResult> cache_;
 
-    std::size_t buildSqliteInvariantIndex(std::size_t limit) {
-        std::size_t built = 0;
-        std::size_t skipped = 0;
-        std::size_t failed = 0;
-        sqliteStore_.forEachUnindexedRecord([&](const PdSqliteStore::Record& record) -> bool {
-            if (limit > 0 && built >= limit) return false;
-            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
-            if (!canonicalPd.has_value()) {
-                ++skipped;
-                return true;
+    enum class IndexWorkStatus {
+        Success,
+        Skipped,
+        Failed,
+    };
+
+    struct IndexWorkResult {
+        IndexWorkStatus status = IndexWorkStatus::Failed;
+        PdSqliteStore::InvariantRecord invariant;
+        std::string name;
+        std::string error;
+    };
+
+    static std::size_t resolveIndexWorkerCount(std::size_t requested) {
+        if (requested > 0) return requested;
+        const unsigned int hardware = std::thread::hardware_concurrency();
+        if (hardware == 0) return 2;
+        return std::max<std::size_t>(1, static_cast<std::size_t>(hardware) / 2);
+    }
+
+    static void printIndexProgress(const IndexBuildStats& stats,
+                                   std::size_t totalTarget,
+                                   std::size_t workers,
+                                   std::chrono::steady_clock::time_point started,
+                                   bool final,
+                                   std::mutex& logMutex) {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsedSeconds =
+            std::max(0.001, std::chrono::duration<double>(now - started).count());
+        const std::size_t processed = stats.processed.load();
+        const std::size_t queued = stats.queued.load();
+        const std::size_t pending = queued > processed ? queued - processed : 0;
+        const double rate = static_cast<double>(processed) / elapsedSeconds;
+        const std::size_t remaining = totalTarget > processed ? totalTarget - processed : 0;
+        const std::uint64_t etaSeconds = rate > 0.0
+            ? static_cast<std::uint64_t>(std::ceil(static_cast<double>(remaining) / rate))
+            : 0;
+        const double percent = totalTarget > 0
+            ? (100.0 * static_cast<double>(std::min(processed, totalTarget)) / static_cast<double>(totalTarget))
+            : 100.0;
+
+        std::ostringstream line;
+        line << (final ? "PD_m index final: " : "PD_m index progress: ")
+             << processed << "/" << totalTarget
+             << " (" << std::fixed << std::setprecision(2) << percent << "%)"
+             << ", written " << stats.written.load()
+             << ", succeeded " << stats.succeeded.load()
+             << ", skipped " << stats.skipped.load()
+             << ", failed " << stats.failed.load()
+             << ", queued " << pending
+             << ", workers " << workers
+             << ", rate " << formatRate(rate) << "/s"
+             << ", elapsed " << formatDurationHms(static_cast<std::uint64_t>(elapsedSeconds))
+             << ", ETA " << formatDurationHms(etaSeconds);
+
+        std::lock_guard<std::mutex> lock(logMutex);
+        std::cerr << line.str() << "\n";
+    }
+
+    IndexBuildResult buildSqliteInvariantIndex(std::size_t limit,
+                                               std::size_t requestedWorkers,
+                                               std::size_t requestedBatchSize,
+                                               int progressSeconds) {
+        const std::size_t workers = resolveIndexWorkerCount(requestedWorkers);
+        const std::size_t batchSize = std::max<std::size_t>(1, requestedBatchSize);
+        const int progressIntervalSeconds = std::max(1, progressSeconds);
+        const std::size_t fetchChunk = std::max<std::size_t>(128, workers * 8);
+        const std::size_t queueCapacity = std::max<std::size_t>(fetchChunk * 2, workers * 16);
+
+        sqliteStore_.beginInvariantBulkBuild();
+        bool bulkBuildOpen = true;
+
+        auto finishBulkBuild = [&] {
+            if (bulkBuildOpen) {
+                sqliteStore_.finishInvariantBulkBuild();
+                bulkBuildOpen = false;
+            }
+        };
+
+        try {
+            const std::size_t unindexed = sqliteStore_.countUnindexedRecords();
+            const std::size_t totalTarget = limit > 0 ? std::min(limit, unindexed) : unindexed;
+            IndexBuildResult summary;
+            summary.totalTarget = totalTarget;
+            if (totalTarget == 0) {
+                std::cerr << "SQLite invariant indexing complete: no unindexed records remain.\n";
+                finishBulkBuild();
+                return summary;
             }
 
-            std::cerr << "indexing " << record.name << " (" << (built + 1) << " built so far)\n";
-            try {
-                LookupResult result = computeInvariants(*canonicalPd, nullptr);
-                if (result.homflyWorker.success && result.khovanovWorker.success) {
-                    sqliteStore_.appendInvariant(record.name, *canonicalPd, result.homfly, result.khovanov);
-                    ++built;
-                } else {
-                    ++failed;
-                    std::cerr << "warning: could not index " << record.name << ": ";
-                    if (!result.homflyWorker.success) {
-                        std::cerr << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
-                    }
-                    if (!result.homflyWorker.success && !result.khovanovWorker.success) std::cerr << "; ";
-                    if (!result.khovanovWorker.success) {
-                        std::cerr << workerFailureMessage("Khovanov", result.khovanovWorker);
-                    }
-                    std::cerr << "\n";
+            std::cerr << "SQLite invariant indexing started: " << totalTarget
+                      << " records, " << workers << " compute workers, batch size "
+                      << batchSize << ", progress interval " << progressIntervalSeconds << " seconds.\n";
+
+            BlockingQueue<PdSqliteStore::Record> inputQueue(queueCapacity);
+            BlockingQueue<IndexWorkResult> outputQueue(queueCapacity);
+            IndexBuildStats stats;
+            std::atomic_bool stopRequested{false};
+            std::atomic_bool reporterDone{false};
+            std::mutex logMutex;
+            std::mutex errorMutex;
+            std::exception_ptr firstError;
+            auto cancellation = std::make_shared<hki::CancellationToken>();
+            const auto started = std::chrono::steady_clock::now();
+
+            auto requestStop = [&] {
+                stopRequested.store(true);
+                cancellation->cancel();
+                inputQueue.close();
+                outputQueue.close();
+            };
+
+            auto setError = [&](std::exception_ptr error) {
+                {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (!firstError) firstError = error;
                 }
-            } catch (const std::exception& error) {
-                ++failed;
-                std::cerr << "warning: could not index " << record.name << ": " << error.what() << "\n";
-            }
-            return !hki::interrupted();
-        });
+                requestStop();
+            };
 
-        std::cerr << "SQLite invariant indexing complete: built " << built
-                  << ", skipped " << skipped << ", failed " << failed << ".\n";
-        return built;
+            std::thread producer([&] {
+                try {
+                    std::string lastName;
+                    std::size_t submitted = 0;
+                    while (!stopRequested.load() && !hki::interrupted() && submitted < totalTarget) {
+                        const std::size_t remaining = totalTarget - submitted;
+                        const std::size_t wanted = std::min(fetchChunk, remaining);
+                        std::vector<PdSqliteStore::Record> records =
+                            sqliteStore_.fetchUnindexedRecordsAfter(lastName, wanted);
+                        if (records.empty()) break;
+                        lastName = records.back().name;
+                        for (PdSqliteStore::Record& record : records) {
+                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) break;
+                            if (!inputQueue.push(std::move(record), stopRequested)) break;
+                            ++submitted;
+                            ++stats.queued;
+                        }
+                        if (records.size() < wanted) break;
+                    }
+                } catch (...) {
+                    setError(std::current_exception());
+                }
+                inputQueue.close();
+            });
+
+            std::vector<std::thread> computeThreads;
+            computeThreads.reserve(workers);
+            for (std::size_t workerIndex = 0; workerIndex < workers; ++workerIndex) {
+                computeThreads.emplace_back([&] {
+                    PdSqliteStore::Record record;
+                    while (inputQueue.pop(record, stopRequested)) {
+                        if (stopRequested.load() || hki::interrupted()) break;
+                        IndexWorkResult work;
+                        work.name = record.name;
+                        try {
+                            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
+                            if (!canonicalPd.has_value()) {
+                                work.status = IndexWorkStatus::Skipped;
+                                work.error = "invalid PD code";
+                            } else {
+                                LookupResult result = computeInvariants(*canonicalPd, cancellation);
+                                if (result.homflyWorker.success && result.khovanovWorker.success) {
+                                    work.status = IndexWorkStatus::Success;
+                                    work.invariant = PdSqliteStore::InvariantRecord{
+                                        record.name,
+                                        *canonicalPd,
+                                        result.homfly,
+                                        result.khovanov,
+                                    };
+                                } else {
+                                    work.status = IndexWorkStatus::Failed;
+                                    std::ostringstream error;
+                                    if (!result.homflyWorker.success) {
+                                        error << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
+                                    }
+                                    if (!result.homflyWorker.success && !result.khovanovWorker.success) error << "; ";
+                                    if (!result.khovanovWorker.success) {
+                                        error << workerFailureMessage("Khovanov", result.khovanovWorker);
+                                    }
+                                    work.error = error.str();
+                                }
+                            }
+                        } catch (const std::exception& error) {
+                            if (stopRequested.load() || hki::interrupted()) break;
+                            work.status = IndexWorkStatus::Failed;
+                            work.error = error.what();
+                        }
+                        if (!outputQueue.push(std::move(work), stopRequested)) break;
+                    }
+                });
+            }
+
+            std::thread writer([&] {
+                std::vector<PdSqliteStore::InvariantRecord> batch;
+                batch.reserve(batchSize);
+                std::size_t failureLogs = 0;
+
+                auto flush = [&] {
+                    if (batch.empty()) return;
+                    const std::size_t written = sqliteStore_.appendInvariantBatch(batch);
+                    stats.written.fetch_add(written);
+                    batch.clear();
+                };
+
+                try {
+                    IndexWorkResult work;
+                    while (outputQueue.pop(work, stopRequested)) {
+                        if (work.status == IndexWorkStatus::Success) {
+                            ++stats.succeeded;
+                            batch.push_back(std::move(work.invariant));
+                            if (batch.size() >= batchSize) flush();
+                        } else if (work.status == IndexWorkStatus::Skipped) {
+                            ++stats.skipped;
+                        } else {
+                            ++stats.failed;
+                            if (failureLogs < 20) {
+                                std::lock_guard<std::mutex> lock(logMutex);
+                                std::cerr << "warning: could not index " << work.name << ": "
+                                          << work.error << "\n";
+                            } else if (failureLogs == 20) {
+                                std::lock_guard<std::mutex> lock(logMutex);
+                                std::cerr << "warning: suppressing further per-record indexing failures.\n";
+                            }
+                            ++failureLogs;
+                        }
+                        ++stats.processed;
+                    }
+                    flush();
+                } catch (...) {
+                    setError(std::current_exception());
+                }
+            });
+
+            std::thread reporter([&] {
+                while (!reporterDone.load()) {
+                    for (int i = 0; i < progressIntervalSeconds && !reporterDone.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::seconds(1));
+                    }
+                    if (!reporterDone.load()) {
+                        printIndexProgress(stats, totalTarget, workers, started, false, logMutex);
+                    }
+                }
+            });
+
+            producer.join();
+            for (std::thread& thread : computeThreads) thread.join();
+            outputQueue.close();
+            writer.join();
+            reporterDone.store(true);
+            reporter.join();
+
+            if (firstError) std::rethrow_exception(firstError);
+            if (hki::interrupted()) {
+                std::cerr << "SQLite invariant indexing interrupted.\n";
+            }
+
+            finishBulkBuild();
+            printIndexProgress(stats, totalTarget, workers, started, true, logMutex);
+
+            summary.written = stats.written.load();
+            summary.skipped = stats.skipped.load();
+            summary.failed = stats.failed.load();
+            std::cerr << "SQLite invariant indexing complete: built " << summary.written
+                      << ", skipped " << summary.skipped
+                      << ", failed " << summary.failed << ".\n";
+            return summary;
+        } catch (...) {
+            finishBulkBuild();
+            throw;
+        }
     }
 
     enum class InvariantKind {
@@ -2541,6 +2949,9 @@ void usage(std::ostream& out) {
         << "  --build-sqlite       Import PD_m_3-16.sorted.txt into PD_m_3-16.sqlite, then exit.\n"
         << "  --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit.\n"
         << "  --index-limit N      Limit newly imported or indexed records in build modes.\n"
+        << "  --index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores.\n"
+        << "  --index-batch-size N SQLite invariant rows per write transaction. Default: 256\n"
+        << "  --index-progress-seconds N  Progress/ETA refresh interval. Default: 5\n"
         << "  --help, -h           Show this help text.\n";
 }
 
@@ -2587,6 +2998,12 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             options.buildPdIndex = true;
         } else if (arg == "--index-limit") {
             options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit").text, "--index-limit"));
+        } else if (arg == "--index-workers") {
+            options.indexWorkers = static_cast<std::size_t>(parsePositiveInt(needValue("--index-workers").text, "--index-workers"));
+        } else if (arg == "--index-batch-size") {
+            options.indexBatchSize = static_cast<std::size_t>(parsePositiveInt(needValue("--index-batch-size").text, "--index-batch-size"));
+        } else if (arg == "--index-progress-seconds") {
+            options.indexProgressSeconds = parsePositiveInt(needValue("--index-progress-seconds").text, "--index-progress-seconds");
         } else if (arg == "--worker") {
             return options;
         } else {
@@ -2619,7 +3036,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (options.buildPdIndex) {
-            engine.buildPdInvariantIndex(options.indexLimit);
+            engine.buildPdInvariantIndex(options.indexLimit,
+                                         options.indexWorkers,
+                                         options.indexBatchSize,
+                                         options.indexProgressSeconds);
             return 0;
         }
 
