@@ -76,9 +76,17 @@ The SQLite database must contain an `invariants` table with these text columns:
 The table may also contain `canonical_pd`, matching the SQLite database
 produced by `knot-indexer-lab`.
 
+`--ban-simplify`
+
+Disable PD-code simplification during lookup. With this option, the executable
+computes HOMFLY-PT and Khovanov only on the input PD code and does not start the
+simplification worker or any simplified-PD invariant workers.
+
 `--print-invariants`
 
-Print the final HOMFLY-PT and Khovanov invariant strings to stderr.
+Print the final HOMFLY-PT and Khovanov invariant strings to stderr. If PD-code
+simplification finishes successfully before the timeout, also print the
+simplified PD code to stderr.
 
 `--verbose`
 
@@ -113,6 +121,9 @@ other HOMFLY-PT worker is cancelled; Khovanov follows the same rule. If one
 invariant type fails or times out but the other succeeds, lookup continues with
 the successful invariant. If both invariant types fail or time out, the program
 exits with status `2`.
+
+When `--ban-simplify` is present, only the original-PD HOMFLY-PT and Khovanov
+workers are started.
 
 Pressing `Ctrl+C` requests a clean shutdown. Active worker processes are
 terminated and the program exits with status `130`.

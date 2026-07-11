@@ -2,11 +2,9 @@
 
 ## QuickStart
 
-This is an independent C++17 code tree for looking up knots from PD codes. It
-computes HOMFLY-PT and integral Khovanov invariants in isolated worker
-processes, races them against the same invariants computed after PD-code
-simplification, and then looks up candidate knot names from external data
-files or SQLite. It does not require SageMath at runtime.
+This is an independent C++17 toolchain for looking up knots from PD codes. It
+does not require SageMath at runtime; detailed algorithms, command line
+options, packaging notes, and module APIs are documented in the manuals below.
 
 Build everything from the repository root:
 
@@ -35,7 +33,7 @@ Run the regression tests:
 python test.py --rebuild
 ```
 
-Manuals:
+## Manuals
 
 - [Command Line](docs/command-line.md): user-facing options and output contract.
 - [Algorithms](docs/algorithms.md): implementation details for normalization,

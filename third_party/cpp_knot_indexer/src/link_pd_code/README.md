@@ -22,7 +22,7 @@ The local version fixes several brittle parts from the upstream code:
 - exact segment parameters from the 2D line equations instead of distance ratios
 - explicit rejection of endpoint crossings, overlapping projected segments, tied
   over/under heights, and multiple crossings at the same projected point
-- AABB/sweep broad-phase pruning before exact segment intersection
+- active-sweep AABB and y-interval pruning before exact segment intersection
 
 By default an isolated no-crossing component contributes no PD crossing, so an
 unknot returns `[]`. Set `Options::encode_isolated_components` to reproduce the

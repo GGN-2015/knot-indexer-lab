@@ -29,14 +29,22 @@ public:
 };
 
 using CoordinateLoop = std::vector<OrderedPoint>;
+using CoordinateLink = std::vector<CoordinateLoop>;
 
 CoordinateLoop parseCoordinateLoopText(const std::string& text,
                                        const ParseOptions& options = ParseOptions());
+CoordinateLink parseCoordinateLinkText(const std::string& text,
+                                       const ParseOptions& options = ParseOptions());
 CoordinateLoop readCoordinateLoopFile(const std::filesystem::path& path,
+                                      const ParseOptions& options = ParseOptions());
+CoordinateLink readCoordinateLinkFile(const std::filesystem::path& path,
                                       const ParseOptions& options = ParseOptions());
 
 std::vector<Point3> positionsOnly(const CoordinateLoop& loop);
+std::vector<std::vector<Point3>> positionsOnly(const CoordinateLink& link);
 std::string formatCoordinateLoop(const CoordinateLoop& loop);
+std::string formatCoordinateLink(const CoordinateLink& link);
+std::string formatLinkCoordinateText(const CoordinateLink& link);
 
 }  // namespace cki::che_to_coord
 
@@ -47,7 +55,6 @@ std::string formatCoordinateLoop(const CoordinateLoop& loop);
 #include <iomanip>
 #include <limits>
 #include <map>
-#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -71,6 +78,23 @@ struct AtomRecord {
 };
 
 using Adjacency = std::unordered_map<std::int64_t, std::vector<std::int64_t>>;
+
+struct EdgeKey {
+    std::int64_t a = 0;
+    std::int64_t b = 0;
+
+    bool operator==(const EdgeKey& other) const {
+        return a == other.a && b == other.b;
+    }
+};
+
+struct EdgeKeyHash {
+    std::size_t operator()(const EdgeKey& key) const {
+        const std::uint64_t a = static_cast<std::uint64_t>(key.a);
+        const std::uint64_t b = static_cast<std::uint64_t>(key.b);
+        return static_cast<std::size_t>((a * 11400714819323198485ull) ^ (b + 0x9e3779b97f4a7c15ull + (a << 6) + (a >> 2)));
+    }
+};
 
 std::string trim(const std::string& input) {
     std::size_t begin = 0;
@@ -263,7 +287,9 @@ std::unordered_map<std::int64_t, AtomRecord> parseAtoms(const std::vector<Source
 Adjacency parseBonds(const std::vector<SourceLine>& lines,
                      const std::unordered_map<std::int64_t, AtomRecord>& atoms) {
     Adjacency adjacency;
-    std::set<std::pair<std::int64_t, std::int64_t>> seen_edges;
+    adjacency.reserve(atoms.size());
+    std::unordered_set<EdgeKey, EdgeKeyHash> seen_edges;
+    seen_edges.reserve(lines.size());
 
     for (const auto& entry : atoms) {
         adjacency.emplace(entry.first, std::vector<std::int64_t>());
@@ -291,7 +317,7 @@ Adjacency parseBonds(const std::vector<SourceLine>& lines,
         }
 
         const auto edge = std::minmax(a, b);
-        if (!seen_edges.emplace(edge.first, edge.second).second) {
+        if (!seen_edges.emplace(EdgeKey{edge.first, edge.second}).second) {
             throw ParseError("line " + std::to_string(line.number) +
                              ": duplicate bond between atoms " + std::to_string(edge.first) +
                              " and " + std::to_string(edge.second));
@@ -306,14 +332,64 @@ Adjacency parseBonds(const std::vector<SourceLine>& lines,
     return adjacency;
 }
 
-std::vector<std::int64_t> orderSingleCycle(const std::unordered_map<std::int64_t, AtomRecord>& atoms,
-                                           const Adjacency& adjacency,
-                                           const ParseOptions& options) {
+std::vector<std::int64_t> traverseCycle(const Adjacency& adjacency,
+                                        std::int64_t start,
+                                        std::int64_t first_next,
+                                        std::size_t expected_size) {
+    std::vector<std::int64_t> order;
+    order.reserve(expected_size);
+    std::unordered_set<std::int64_t> visited;
+    visited.reserve(expected_size);
+
+    std::int64_t previous = start;
+    std::int64_t current = start;
+    std::int64_t next = first_next;
+    while (true) {
+        if (!visited.insert(current).second) {
+            throw ParseError("cycle traversal repeated atom " + std::to_string(current) +
+                             " before closing the loop");
+        }
+        order.push_back(current);
+
+        if (next == start) {
+            if (order.size() != expected_size) {
+                throw ParseError("bonds contain a smaller closed cycle before all component atoms are visited");
+            }
+            break;
+        }
+        previous = current;
+        current = next;
+        const std::vector<std::int64_t>& neighbors = adjacency.at(current);
+        next = neighbors[0] == previous ? neighbors[1] : neighbors[0];
+    }
+
+    return order;
+}
+
+std::vector<std::int64_t> orderCycleComponent(const Adjacency& adjacency,
+                                             const std::vector<std::int64_t>& component_atoms,
+                                             const ParseOptions& options) {
+    if (component_atoms.size() < 3) {
+        throw ParseError("a molecular link component must contain at least three atoms");
+    }
+
+    std::int64_t start = component_atoms.front();
+    if (options.prefer_atom_one_start &&
+        std::find(component_atoms.begin(), component_atoms.end(), 1) != component_atoms.end()) {
+        start = 1;
+    }
+
+    const std::vector<std::int64_t>& neighbors = adjacency.at(start);
+    std::vector<std::int64_t> first = traverseCycle(adjacency, start, neighbors[0], component_atoms.size());
+    std::vector<std::int64_t> second = traverseCycle(adjacency, start, neighbors[1], component_atoms.size());
+    return std::lexicographical_compare(second.begin(), second.end(), first.begin(), first.end()) ? second : first;
+}
+
+std::vector<std::vector<std::int64_t>> connectedCycleComponents(
+    const std::unordered_map<std::int64_t, AtomRecord>& atoms,
+    const Adjacency& adjacency) {
     if (atoms.empty()) {
         throw ParseError("no atoms were found");
-    }
-    if (atoms.size() < 3) {
-        throw ParseError("a molecular knot loop must contain at least three atoms");
     }
 
     for (const auto& entry : atoms) {
@@ -322,54 +398,52 @@ std::vector<std::int64_t> orderSingleCycle(const std::unordered_map<std::int64_t
         if (degree != 2) {
             throw ParseError("atom " + std::to_string(entry.first) +
                              " has degree " + std::to_string(degree) +
-                             "; expected degree 2 for a single loop");
+                             "; expected degree 2 for every link component");
         }
     }
 
-    std::int64_t start = std::numeric_limits<std::int64_t>::max();
-    if (options.prefer_atom_one_start && atoms.find(1) != atoms.end()) {
-        start = 1;
-    } else {
-        for (const auto& entry : atoms) {
-            start = std::min(start, entry.first);
-        }
+    std::vector<std::int64_t> atom_ids;
+    atom_ids.reserve(atoms.size());
+    for (const auto& entry : atoms) {
+        atom_ids.push_back(entry.first);
     }
+    std::sort(atom_ids.begin(), atom_ids.end());
 
-    std::vector<std::int64_t> order;
-    order.reserve(atoms.size());
     std::unordered_set<std::int64_t> visited;
+    visited.reserve(atoms.size());
+    std::vector<std::vector<std::int64_t>> components;
 
-    std::int64_t previous = 0;
-    std::int64_t current = start;
-    while (true) {
-        if (!visited.insert(current).second) {
-            throw ParseError("cycle traversal repeated atom " + std::to_string(current) +
-                             " before closing the loop");
+    for (std::int64_t root : atom_ids) {
+        if (visited.find(root) != visited.end()) {
+            continue;
         }
-        order.push_back(current);
 
-        const std::vector<std::int64_t>& neighbors = adjacency.at(current);
-        std::int64_t next = neighbors[0] == previous ? neighbors[1] : neighbors[0];
-
-        if (next == start) {
-            if (order.size() != atoms.size()) {
-                throw ParseError("bonds contain a smaller closed cycle before all atoms are visited");
+        std::vector<std::int64_t> stack{root};
+        std::vector<std::int64_t> component;
+        visited.insert(root);
+        while (!stack.empty()) {
+            const std::int64_t current = stack.back();
+            stack.pop_back();
+            component.push_back(current);
+            for (std::int64_t neighbor : adjacency.at(current)) {
+                if (visited.insert(neighbor).second) {
+                    stack.push_back(neighbor);
+                }
             }
-            break;
         }
-        previous = current;
-        current = next;
+        std::sort(component.begin(), component.end());
+        components.push_back(std::move(component));
     }
 
-    if (order.size() != atoms.size()) {
-        throw ParseError("bond graph is not a connected single cycle");
-    }
-    return order;
+    std::sort(components.begin(), components.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.front() < rhs.front();
+    });
+    return components;
 }
 
 }  // namespace
 
-inline CoordinateLoop parseCoordinateLoopText(const std::string& text, const ParseOptions& options) {
+inline CoordinateLink parseCoordinateLinkText(const std::string& text, const ParseOptions& options) {
     const std::vector<SourceLine> lines = linesFromText(text);
     const auto sections = extractSections(lines);
 
@@ -399,14 +473,29 @@ inline CoordinateLoop parseCoordinateLoopText(const std::string& text, const Par
         throw ParseError("internal adjacency size mismatch");
     }
 
-    const std::vector<std::int64_t> order = orderSingleCycle(atoms, adjacency, options);
-    CoordinateLoop loop;
-    loop.reserve(order.size());
-    for (std::int64_t atom_id : order) {
-        const AtomRecord& atom = atoms.at(atom_id);
-        loop.push_back(OrderedPoint{atom.id, atom.position});
+    CoordinateLink link;
+    const std::vector<std::vector<std::int64_t>> components = connectedCycleComponents(atoms, adjacency);
+    link.reserve(components.size());
+    for (const std::vector<std::int64_t>& component : components) {
+        const std::vector<std::int64_t> order = orderCycleComponent(adjacency, component, options);
+        CoordinateLoop loop;
+        loop.reserve(order.size());
+        for (std::int64_t atom_id : order) {
+            const AtomRecord& atom = atoms.at(atom_id);
+            loop.push_back(OrderedPoint{atom.id, atom.position});
+        }
+        link.push_back(std::move(loop));
     }
-    return loop;
+    return link;
+}
+
+inline CoordinateLoop parseCoordinateLoopText(const std::string& text, const ParseOptions& options) {
+    CoordinateLink link = parseCoordinateLinkText(text, options);
+    if (link.size() != 1) {
+        throw ParseError("expected one connected cycle, found " + std::to_string(link.size()) +
+                         "; use parseCoordinateLinkText for multi-component links");
+    }
+    return std::move(link.front());
 }
 
 inline CoordinateLoop readCoordinateLoopFile(const std::filesystem::path& path, const ParseOptions& options) {
@@ -419,6 +508,16 @@ inline CoordinateLoop readCoordinateLoopFile(const std::filesystem::path& path, 
     return parseCoordinateLoopText(buffer.str(), options);
 }
 
+inline CoordinateLink readCoordinateLinkFile(const std::filesystem::path& path, const ParseOptions& options) {
+    std::ifstream input(path);
+    if (!input) {
+        throw ParseError("cannot open molecule file: " + displayPath(path));
+    }
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return parseCoordinateLinkText(buffer.str(), options);
+}
+
 inline std::vector<Point3> positionsOnly(const CoordinateLoop& loop) {
     std::vector<Point3> points;
     points.reserve(loop.size());
@@ -426,6 +525,15 @@ inline std::vector<Point3> positionsOnly(const CoordinateLoop& loop) {
         points.push_back(point.position);
     }
     return points;
+}
+
+inline std::vector<std::vector<Point3>> positionsOnly(const CoordinateLink& link) {
+    std::vector<std::vector<Point3>> components;
+    components.reserve(link.size());
+    for (const CoordinateLoop& loop : link) {
+        components.push_back(positionsOnly(loop));
+    }
+    return components;
 }
 
 inline std::string formatCoordinateLoop(const CoordinateLoop& loop) {
@@ -436,6 +544,33 @@ inline std::string formatCoordinateLoop(const CoordinateLoop& loop) {
                << point.position.x << ' '
                << point.position.y << ' '
                << point.position.z << '\n';
+    }
+    return output.str();
+}
+
+inline std::string formatCoordinateLink(const CoordinateLink& link) {
+    std::ostringstream output;
+    output << std::setprecision(17);
+    for (std::size_t component = 0; component < link.size(); ++component) {
+        if (component != 0) {
+            output << '\n';
+        }
+        output << formatCoordinateLoop(link[component]);
+    }
+    return output.str();
+}
+
+inline std::string formatLinkCoordinateText(const CoordinateLink& link) {
+    std::ostringstream output;
+    output << std::setprecision(17);
+    output << link.size() << '\n';
+    for (const CoordinateLoop& loop : link) {
+        output << loop.size() << '\n';
+        for (const OrderedPoint& point : loop) {
+            output << point.position.x << ' '
+                   << point.position.y << ' '
+                   << point.position.z << '\n';
+        }
     }
     return output.str();
 }

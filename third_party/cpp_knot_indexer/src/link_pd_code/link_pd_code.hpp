@@ -52,9 +52,12 @@ std::string formatPDCode(const PDCode& pd_code);
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <queue>
+#include <set>
 #include <sstream>
 #include <unordered_set>
 
@@ -467,6 +470,11 @@ std::vector<std::vector<ProjectedPoint>> projectLink(const Link& link,
 std::vector<Segment> buildSegments(const std::vector<std::vector<ProjectedPoint>>& link,
                                    double epsilon) {
     std::vector<Segment> segments;
+    std::size_t total_segments = 0;
+    for (const auto& component : link) {
+        total_segments += component.size();
+    }
+    segments.reserve(total_segments);
     for (std::size_t component = 0; component < link.size(); ++component) {
         const std::vector<ProjectedPoint>& points = link[component];
         for (std::size_t i = 0; i < points.size(); ++i) {
@@ -660,6 +668,20 @@ std::optional<ProjectionCrossing> intersectSegments(const Segment& a,
     return crossing;
 }
 
+struct ActiveByY {
+    double min_y = 0.0;
+    int index = 0;
+};
+
+struct ActiveByYLess {
+    bool operator()(const ActiveByY& lhs, const ActiveByY& rhs) const {
+        if (lhs.min_y != rhs.min_y) {
+            return lhs.min_y < rhs.min_y;
+        }
+        return lhs.index < rhs.index;
+    }
+};
+
 std::vector<ProjectionCrossing> findProjectedCrossings(
     const std::vector<std::vector<ProjectedPoint>>& link,
     double epsilon) {
@@ -676,21 +698,44 @@ std::vector<ProjectionCrossing> findProjectedCrossings(
     });
 
     std::vector<ProjectionCrossing> crossings;
-    for (std::size_t left = 0; left < order.size(); ++left) {
-        const Segment& a = segments[static_cast<std::size_t>(order[left])];
-        for (std::size_t right = left + 1; right < order.size(); ++right) {
-            const Segment& b = segments[static_cast<std::size_t>(order[right])];
-            if (b.min_x > a.max_x + epsilon) {
-                break;
-            }
-            if (!yRangesOverlap(a, b, epsilon) || sameOrAdjacent(a, b, link)) {
+    std::multiset<ActiveByY, ActiveByYLess> active_by_y;
+    using ActiveIterator = std::multiset<ActiveByY, ActiveByYLess>::iterator;
+    std::vector<ActiveIterator> active_iterators(segments.size());
+    std::vector<bool> active(segments.size(), false);
+    using Expiry = std::pair<double, int>;
+    std::priority_queue<Expiry, std::vector<Expiry>, std::greater<Expiry>> expires_by_x;
+
+    for (int current_index : order) {
+        const Segment& current = segments[static_cast<std::size_t>(current_index)];
+        while (!expires_by_x.empty() && expires_by_x.top().first < current.min_x - epsilon) {
+            const int expired_index = expires_by_x.top().second;
+            expires_by_x.pop();
+            if (!active[static_cast<std::size_t>(expired_index)]) {
                 continue;
             }
-            std::optional<ProjectionCrossing> crossing = intersectSegments(a, b, epsilon);
+            active_by_y.erase(active_iterators[static_cast<std::size_t>(expired_index)]);
+            active[static_cast<std::size_t>(expired_index)] = false;
+        }
+
+        for (auto it = active_by_y.begin();
+             it != active_by_y.end() && it->min_y <= current.max_y + epsilon;
+             ++it) {
+            const int other_index = it->index;
+            const Segment& other = segments[static_cast<std::size_t>(other_index)];
+            if (other.max_y < current.min_y - epsilon ||
+                sameOrAdjacent(other, current, link)) {
+                continue;
+            }
+            std::optional<ProjectionCrossing> crossing = intersectSegments(other, current, epsilon);
             if (crossing.has_value()) {
                 crossings.push_back(*crossing);
             }
         }
+
+        active_iterators[static_cast<std::size_t>(current_index)] =
+            active_by_y.insert(ActiveByY{current.min_y, current_index});
+        active[static_cast<std::size_t>(current_index)] = true;
+        expires_by_x.push(Expiry{current.max_x, current_index});
     }
 
     std::sort(crossings.begin(), crossings.end(), [](const ProjectionCrossing& a,

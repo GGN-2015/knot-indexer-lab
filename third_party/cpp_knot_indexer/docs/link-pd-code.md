@@ -87,8 +87,14 @@ needed.
 The tool projects 3D coordinates to a plane, detects segment intersections,
 rejects non-generic diagrams, assigns strand labels along oriented components,
 and formats crossings from the incoming under-strand. The implementation uses
-bounding-box pruning, interval checks, and exact integer fallback for brittle
-2D segment cases such as near-parallel segments and endpoint intersections.
+an active sweep over projected segment bounding boxes, y-interval pruning,
+interval checks, and exact integer fallback for brittle 2D segment cases such
+as near-parallel segments and endpoint intersections.
+
+The same path is used for knots and multi-component links. Label assignment is
+performed per oriented component and then merged into one PD code, so crossings
+between different components and self-crossings on one component share the same
+validation rules.
 
 By default it tries deterministic candidate directions and keeps a successful
 projection with fewer crossings. `--direction` is useful for reproducible tests

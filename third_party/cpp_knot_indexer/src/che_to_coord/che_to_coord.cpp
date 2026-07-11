@@ -32,23 +32,11 @@ void writeTextFile(const std::filesystem::path& path, const std::string& text) {
     output << text;
 }
 
-std::string formatForLinkPDCode(const cki::che_to_coord::CoordinateLoop& loop) {
-    std::ostringstream output;
-    output.precision(17);
-    output << "1\n" << loop.size() << '\n';
-    for (const cki::che_to_coord::OrderedPoint& point : loop) {
-        output << point.position.x << ' '
-               << point.position.y << ' '
-               << point.position.z << '\n';
-    }
-    return output.str();
-}
-
 void printUsage(std::ostream& output) {
     output
         << "Usage: che_to_coord [OPTIONS] [INPUT]\n"
         << "\n"
-        << "Read a molecule data file with Atoms and Bonds sections and write an ordered 3D loop.\n"
+        << "Read a molecule data file with Atoms and Bonds sections and write ordered 3D link components.\n"
         << "If INPUT and --input are omitted, input is read from stdin.\n"
         << "\n"
         << "Options:\n"
@@ -120,10 +108,11 @@ int main(int argc, char** argv) {
         }
 
         const std::string text = have_input ? readTextFile(input_path) : readAll(std::cin);
-        const cki::che_to_coord::CoordinateLoop loop =
-            cki::che_to_coord::parseCoordinateLoopText(text, options);
+        const cki::che_to_coord::CoordinateLink link =
+            cki::che_to_coord::parseCoordinateLinkText(text, options);
         const std::string rendered =
-            format == "link" ? formatForLinkPDCode(loop) : cki::che_to_coord::formatCoordinateLoop(loop);
+            format == "link" ? cki::che_to_coord::formatLinkCoordinateText(link)
+                             : cki::che_to_coord::formatCoordinateLink(link);
 
         if (have_output) {
             writeTextFile(output_path, rendered);

@@ -67,7 +67,7 @@ The `third_party/cpp_knot_indexer` tree is vendored from
 [`GGN-2015/cpp_knot_indexer`](https://github.com/GGN-2015/cpp_knot_indexer).
 It includes the HOMFLY-PT, Khovanov, and PD-code simplification
 implementations used by this server. This vendored copy was refreshed from
-upstream commit `b1c606ddf01a6a0d733e050dd1059a65694d179f`.
+upstream commit `d75a8e149a5332b7e7c5e0844139639682aba05d`.
 
 SQLite is vendored from the official amalgamation package and is compiled into
 the server. See the vendored licenses for details.

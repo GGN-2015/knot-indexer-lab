@@ -2,13 +2,13 @@
 
 Pure C++17 parser for the molecule data files used by the old
 `che_data_to_spatial_coord` path. The module reads `Atoms` and `Bonds` sections,
-validates that the bond graph is one connected degree-2 cycle, and returns 3D
-points ordered along that cycle.
+validates that every connected component of the bond graph is a degree-2 cycle,
+and returns 3D points ordered along each component.
 
 The parser accepts atom rows in these forms:
 
 - `id x y z`
-- old LAMMPS-style rows where `x y z` are fields 4-6
+- common LAMMPS-style rows where `x y z` appear after id/type/molecule fields
 
 Malformed rows, duplicate atoms, duplicate bonds, unknown bond endpoints, and
 non-cycle graphs raise `cki::che_to_coord::ParseError` with a line-aware message

@@ -49,6 +49,7 @@ struct Options {
     int timeoutSeconds = 60;
     bool verbose = false;
     bool printInvariants = false;
+    bool banSimplify = false;
 };
 
 struct DataPaths {
@@ -82,6 +83,7 @@ void usage(std::ostream& out) {
         << "  --timeout SEC       Max seconds for HOMFLY-PT and Khovanov each (0 disables timeout; default 60).\n"
         << "  --data-folder PATH  Folder containing knotname-reg/ and text or SQLite invariant data.\n"
         << "  --sqlite-db PATH    Explicit SQLite invariant database. Overrides auto-detected SQLite files.\n"
+        << "  --ban-simplify      Do not simplify the input PD code before invariant lookup.\n"
         << "  --print-invariants  Print computed invariant strings to stderr.\n"
         << "  --verbose           Print worker status, failures, and invariant strings to stderr.\n";
 }
@@ -225,6 +227,8 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             options.dataFolder = needValue("--data-folder").path;
         } else if (arg == "--sqlite-db") {
             options.sqliteDb = needValue("--sqlite-db").path;
+        } else if (arg == "--ban-simplify") {
+            options.banSimplify = true;
         } else if (arg == "--print-invariants") {
             options.printInvariants = true;
         } else if (arg == "--verbose") {
@@ -299,6 +303,7 @@ struct InvariantPipelineResult {
     WorkerResult simplify;
     std::string originalPd;
     std::string simplifiedPd;
+    bool simplifyEnabled = true;
     bool simplifiedUsable = false;
 };
 
@@ -365,9 +370,11 @@ void eraseFinishedCancelled(std::vector<RunningAttempt>& running) {
 
 InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& executable,
                                                  const std::string& canonicalPd,
-                                                 int timeoutSeconds) {
+                                                 int timeoutSeconds,
+                                                 bool enableSimplify) {
     InvariantPipelineResult result;
     result.originalPd = canonicalPd;
+    result.simplifyEnabled = enableSimplify;
 
     const auto deadline = timeoutSeconds > 0
         ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds)
@@ -390,8 +397,8 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
     startInvariant(InvariantKind::Homfly, "original", canonicalPd);
     startInvariant(InvariantKind::Khovanov, "original", canonicalPd);
     std::unique_ptr<WorkerProcess> simplify =
-        startWorkerProcess(executable, "simplify", canonicalPd);
-    bool simplifyFinished = false;
+        enableSimplify ? startWorkerProcess(executable, "simplify", canonicalPd) : nullptr;
+    bool simplifyFinished = !enableSimplify;
     bool simplifiedAttemptsStarted = false;
 
     auto maybeStartSimplifiedAttempts = [&]() {
@@ -525,9 +532,13 @@ void printPipelineDetails(const InvariantPipelineResult& pipeline, bool printVal
         }
     }
 
-    printWorkerDetails("Simplify", pipeline.simplify, false);
-    if (pipeline.simplify.success) {
-        std::cerr << "Simplify result: " << pipeline.simplify.output << "\n";
+    if (pipeline.simplifyEnabled) {
+        printWorkerDetails("Simplify", pipeline.simplify, false);
+        if (pipeline.simplify.success) {
+            std::cerr << "Simplify result: " << pipeline.simplify.output << "\n";
+        }
+    } else {
+        std::cerr << "Simplify: disabled by --ban-simplify\n";
     }
 
     const SelectedInvariant& khovanov = pipeline.khovanov;
@@ -598,7 +609,7 @@ int main(int argc, char** argv) {
         hki::DataPaths dataPaths = hki::findDataPaths(executable, options.dataFolder, options.sqliteDb);
 
         hki::InvariantPipelineResult pipeline =
-            hki::computeInvariantPipeline(executable, canonicalPd, options.timeoutSeconds);
+            hki::computeInvariantPipeline(executable, canonicalPd, options.timeoutSeconds, !options.banSimplify);
         hki::WorkerResult khResult = pipeline.khovanov.result;
         hki::WorkerResult homResult = pipeline.homfly.result;
 
@@ -612,6 +623,9 @@ int main(int argc, char** argv) {
         } else if (options.printInvariants) {
             std::cerr << "Khovanov result: " << (khResult.success ? khResult.output : "<failed>") << "\n";
             std::cerr << "HOMFLY-PT result: " << (homResult.success ? homResult.output : "<failed>") << "\n";
+            if (pipeline.simplifyEnabled && pipeline.simplify.success) {
+                std::cerr << "Simplified PD code result: " << pipeline.simplify.output << "\n";
+            }
         }
 
         if (!khResult.success && !homResult.success) {

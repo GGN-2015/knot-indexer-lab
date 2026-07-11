@@ -18,8 +18,9 @@ Reusable code in this directory is exposed through `.hpp` headers. The main
 `src/che_to_coord`
 
 Standalone molecule-data-to-coordinate library. It parses molecule files with
-`Atoms` and `Bonds` sections and returns a validated ordered 3D coordinate
-cycle. It also has its own `che_to_coord` command line executable.
+`Atoms` and `Bonds` sections and returns validated ordered 3D coordinate
+cycles for one or more link components. It also has its own `che_to_coord`
+command line executable.
 
 Use `#include "che_to_coord.hpp"` to consume the library directly. The matching
 `.cpp` file contains only the command line interface.
@@ -128,12 +129,17 @@ Important API types and functions:
 
 - `Point3`
 - `OrderedPoint`
+- `CoordinateLink`
 - `ParseOptions`
 - `ParseError`
 - `parseCoordinateLoopText`
+- `parseCoordinateLinkText`
 - `readCoordinateLoopFile`
+- `readCoordinateLinkFile`
 - `positionsOnly`
 - `formatCoordinateLoop`
+- `formatCoordinateLink`
+- `formatLinkCoordinateText`
 
 `che_to_coord.cpp`
 
