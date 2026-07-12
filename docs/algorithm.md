@@ -40,6 +40,37 @@ accepts values up to 16. Prime factors use the number after `K`, and composite
 names sum all comma-separated factors. Mirror prefixes do not change the
 crossing number.
 
+## SVG Diagram Generation
+
+Every successful lookup response includes an SVG diagram generated from the
+returned PD code. The same renderer is available from the command line with
+`--render-pd-svg`.
+
+The renderer follows the `pd-code-to-diagram` matrix model:
+
+- positive matrix cells are strand arc numbers
+- `-1` means the vertical strand passes under the horizontal strand
+- `-2` means the horizontal strand passes under the vertical strand
+- `0` is empty space
+
+The server tries multiple deterministic layout seeds and keeps the compact
+candidate with the lowest layout score. The score penalizes area, blank cells,
+extra turns, unsupported local topology, and open endpoints. This keeps the
+output stable while avoiding a visibly worse first layout when a better seed is
+available.
+
+SVG strands are drawn as vector paths on a white background. Quarter-turn tiles
+use the outward-bulging orientation relative to the local bend, so the visible
+strand rounds around the outside of the turn instead of cutting into the
+diagram interior. Crossings are drawn in two layers: the under-strand is drawn
+first, a white gap masks the crossing center, and the over-strand is drawn on
+top.
+
+Each crossing also renders the four adjacent arc numbers around the crossing.
+The labels are taken directly from the neighboring positive matrix cells: top,
+right, bottom, and left. Labels are drawn last with a white stroke behind the
+red text so they remain readable over strands.
+
 ## Name Canonicalization
 
 Knot names are normalized by the upstream `NameNormalizer`. Legacy names from

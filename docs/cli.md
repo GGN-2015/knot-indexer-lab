@@ -87,6 +87,39 @@ Server options:
 --help, -h           Show help text
 ```
 
+## PD SVG Generation
+
+The server binary can also render a PD code to an SVG file without loading the
+runtime invariant data or starting the HTTP server:
+
+```sh
+build/knot_indexer_lab_server --render-pd-svg --input code.txt --output diagram.svg
+```
+
+On Windows:
+
+```powershell
+.\build\knot_indexer_lab_server.exe --render-pd-svg --input code.txt --output diagram.svg
+```
+
+Inline PD input is also supported:
+
+```sh
+build/knot_indexer_lab_server --render-pd-svg --pd "[[4,2,5,1],[2,6,3,5],[6,4,1,3]]" --output trefoil.svg
+```
+
+SVG CLI options:
+
+```text
+--render-pd-svg      Render a PD code as SVG and exit.
+--pd TEXT            Inline PD code. Mutually exclusive with --input.
+--input PATH         File containing one PD code. Mutually exclusive with --pd.
+--output PATH        SVG output path. If omitted, SVG is written to stdout.
+```
+
+The SVG renderer uses only the PD-code diagram layout path. It does not compute
+HOMFLY-PT, Khovanov homology, candidate names, or simplification.
+
 ## Runtime Data
 
 The runtime data folder uses the upstream text layout:

@@ -116,6 +116,13 @@ struct Options {
     int maxCrossing = kDefaultMaxCrossing;
     std::filesystem::path dataFolder;
     std::filesystem::path webRoot;
+    bool renderPdSvg = false;
+    bool svgInputFromFile = false;
+    bool svgInputInline = false;
+    bool svgOutputToFile = false;
+    std::filesystem::path svgInputPath;
+    std::filesystem::path svgOutputPath;
+    std::string svgInlinePd;
 };
 
 struct DataPaths {
@@ -1254,12 +1261,15 @@ void appendSvgLine(std::ostringstream& svg,
 void appendSvgCorner(std::ostringstream& svg,
                      double sx,
                      double sy,
-                     double cx,
-                     double cy,
+                     double c1x,
+                     double c1y,
+                     double c2x,
+                     double c2y,
                      double ex,
                      double ey) {
     svg << "<path class=\"strand\" d=\"M " << svgNumber(sx) << " " << svgNumber(sy)
-        << " Q " << svgNumber(cx) << " " << svgNumber(cy)
+        << " C " << svgNumber(c1x) << " " << svgNumber(c1y)
+        << " " << svgNumber(c2x) << " " << svgNumber(c2y)
         << " " << svgNumber(ex) << " " << svgNumber(ey) << "\"/>\n";
 }
 
@@ -1272,20 +1282,24 @@ void appendSvgRegularTile(std::ostringstream& svg,
                           double tile) {
     const double midX = x + tile / 2.0;
     const double midY = y + tile / 2.0;
+    const double nearX = x + tile * 0.18;
+    const double farX = x + tile * 0.82;
+    const double nearY = y + tile * 0.18;
+    const double farY = y + tile * 0.82;
     const int mask = diagramLineMask(matrix, row, col);
 
     switch (mask) {
         case kDiagramTop | kDiagramRight:
-            appendSvgCorner(svg, midX, y, x + tile, y, x + tile, midY);
+            appendSvgCorner(svg, midX, y, midX, farY, nearX, midY, x + tile, midY);
             return;
         case kDiagramRight | kDiagramBottom:
-            appendSvgCorner(svg, x + tile, midY, x + tile, y + tile, midX, y + tile);
+            appendSvgCorner(svg, x + tile, midY, nearX, midY, midX, nearY, midX, y + tile);
             return;
         case kDiagramBottom | kDiagramLeft:
-            appendSvgCorner(svg, midX, y + tile, x, y + tile, x, midY);
+            appendSvgCorner(svg, midX, y + tile, midX, nearY, farX, midY, x, midY);
             return;
         case kDiagramLeft | kDiagramTop:
-            appendSvgCorner(svg, x, midY, x, y, midX, y);
+            appendSvgCorner(svg, x, midY, farX, midY, midX, farY, midX, y);
             return;
         case kDiagramTop | kDiagramBottom:
             appendSvgLine(svg, midX, y, midX, y + tile);
@@ -1327,6 +1341,50 @@ void appendSvgCrossingTile(std::ostringstream& svg,
     }
 }
 
+void appendSvgArcLabel(std::ostringstream& svg,
+                       int value,
+                       double x,
+                       double y,
+                       const char* anchor) {
+    if (value <= 0) return;
+    svg << "<text class=\"arc-label\" x=\"" << svgNumber(x)
+        << "\" y=\"" << svgNumber(y)
+        << "\" text-anchor=\"" << anchor << "\">"
+        << value << "</text>\n";
+}
+
+void appendSvgCrossingLabels(std::ostringstream& svg,
+                             const IntMatrix& matrix,
+                             int row,
+                             int col,
+                             double x,
+                             double y,
+                             double tile) {
+    constexpr double margin = 3.0;
+    constexpr double fontBaseline = 8.0;
+
+    appendSvgArcLabel(svg,
+                      matrix.getPos(row - 1, col),
+                      x + tile - margin,
+                      y - margin,
+                      "end");
+    appendSvgArcLabel(svg,
+                      matrix.getPos(row, col + 1),
+                      x + tile + margin,
+                      y + margin + fontBaseline,
+                      "start");
+    appendSvgArcLabel(svg,
+                      matrix.getPos(row + 1, col),
+                      x + margin,
+                      y + tile + margin + fontBaseline,
+                      "start");
+    appendSvgArcLabel(svg,
+                      matrix.getPos(row, col - 1),
+                      x - margin,
+                      y + tile - margin,
+                      "end");
+}
+
 std::string renderUnknotSvg(const std::string& title) {
     constexpr int width = 180;
     constexpr int height = 150;
@@ -1363,6 +1421,9 @@ std::string renderPdMatrixSvg(const IntMatrix& matrix, const std::string& title)
         << ".strand{fill:none;stroke:#111827;stroke-width:4;stroke-linecap:butt;"
         << "stroke-linejoin:round;shape-rendering:geometricPrecision}"
         << ".gap{fill:white;stroke:white;stroke-width:0}"
+        << ".arc-label{font-family:Arial,DejaVu Sans,sans-serif;font-size:9px;"
+        << "font-weight:700;fill:#dc2626;stroke:white;stroke-width:3px;"
+        << "paint-order:stroke fill;stroke-linejoin:round}"
         << "</style>\n";
 
     for (int row = bounds.minRow; row <= bounds.maxRow; ++row) {
@@ -1382,6 +1443,16 @@ std::string renderPdMatrixSvg(const IntMatrix& matrix, const std::string& title)
             const double x = padding + static_cast<double>(col - bounds.minCol) * tile;
             const double y = padding + static_cast<double>(row - bounds.minRow) * tile;
             appendSvgCrossingTile(svg, value, x, y, tile);
+        }
+    }
+
+    for (int row = bounds.minRow; row <= bounds.maxRow; ++row) {
+        for (int col = bounds.minCol; col <= bounds.maxCol; ++col) {
+            const int value = matrix.getPos(row, col);
+            if (value != -1 && value != -2) continue;
+            const double x = padding + static_cast<double>(col - bounds.minCol) * tile;
+            const double y = padding + static_cast<double>(row - bounds.minRow) * tile;
+            appendSvgCrossingLabels(svg, matrix, row, col, x, y, tile);
         }
     }
 
@@ -2243,6 +2314,9 @@ private:
 
 void usage(std::ostream& out) {
     out << "Usage: knot_indexer_lab_server [OPTIONS]\n\n"
+        << "SVG generation:\n"
+        << "  knot_indexer_lab_server --render-pd-svg --input code.txt --output diagram.svg\n"
+        << "  knot_indexer_lab_server --render-pd-svg --pd \"[[4,2,5,1],...]\"\n\n"
         << "Options:\n"
         << "  --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0\n"
         << "  --port PORT          TCP port. Default: 5000\n"
@@ -2250,6 +2324,10 @@ void usage(std::ostream& out) {
         << "  --web-root PATH      Folder containing index.html and static/.\n"
         << "  --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200\n"
         << "  --max-crossing N     Maximum total crossing number. Default: 14, max: 16\n"
+        << "  --render-pd-svg      Render a PD code as an SVG and exit.\n"
+        << "  --pd TEXT            Inline PD code for --render-pd-svg.\n"
+        << "  --input PATH         PD-code input file for --render-pd-svg.\n"
+        << "  --output PATH        SVG output file for --render-pd-svg. Default: stdout\n"
         << "  --help, -h           Show this help text.\n";
 }
 
@@ -2295,13 +2373,46 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             if (options.maxCrossing > kHardMaxCrossing) {
                 throw std::runtime_error("--max-crossing must not exceed 16");
             }
+        } else if (arg == "--render-pd-svg") {
+            options.renderPdSvg = true;
+        } else if (arg == "--pd") {
+            options.svgInlinePd = needValue("--pd").text;
+            options.svgInputInline = true;
+        } else if (arg == "--input") {
+            options.svgInputPath = needValue("--input").path;
+            options.svgInputFromFile = true;
+        } else if (arg == "--output") {
+            options.svgOutputPath = needValue("--output").path;
+            options.svgOutputToFile = true;
         } else if (arg == "--worker") {
             return options;
         } else {
             throw std::runtime_error("unknown option: " + arg);
         }
     }
+    if (options.renderPdSvg) {
+        if (options.svgInputFromFile == options.svgInputInline) {
+            throw std::runtime_error("--render-pd-svg needs exactly one of --input or --pd");
+        }
+    } else if (options.svgInputFromFile || options.svgInputInline || options.svgOutputToFile) {
+        throw std::runtime_error("--pd, --input, and --output are only valid with --render-pd-svg");
+    }
     return options;
+}
+
+int renderPdSvgCli(const Options& options) {
+    const std::string pdText = options.svgInputInline ? options.svgInlinePd : readWholeFile(options.svgInputPath);
+    const PdDiagram diagram = buildPdDiagram(pdText);
+    if (!diagram.error.empty()) {
+        throw std::runtime_error("cannot render PD SVG: " + diagram.error);
+    }
+
+    if (options.svgOutputToFile) {
+        writeWholeFile(options.svgOutputPath, diagram.svg + "\n");
+    } else {
+        std::cout << diagram.svg << "\n";
+    }
+    return 0;
 }
 
 }  // namespace
@@ -2319,6 +2430,10 @@ int main(int argc, char** argv) {
 
         hki::installInterruptHandlers();
         const lab::Options options = lab::parseOptions(args);
+        if (options.renderPdSvg) {
+            return lab::renderPdSvgCli(options);
+        }
+
         const std::filesystem::path executable = lab::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
         lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing);

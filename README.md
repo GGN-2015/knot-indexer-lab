@@ -39,6 +39,18 @@ The task monitor is available from the main page and directly at:
 http://127.0.0.1:5000/tasks.html
 ```
 
+Generate an SVG diagram from a PD code without starting the server:
+
+```sh
+build/knot_indexer_lab_server --render-pd-svg --input code.txt --output diagram.svg
+```
+
+On Windows:
+
+```powershell
+.\build\knot_indexer_lab_server.exe --render-pd-svg --input code.txt --output diagram.svg
+```
+
 Runtime lookup data uses the upstream `cpp_knot_indexer` text layout:
 
 ```text
@@ -60,7 +72,7 @@ On Windows, replace `build/knot_indexer_lab_server` with
 
 - [CLI Manual](docs/cli.md): build script and server options.
 - [Runtime Data Manual](docs/runtime-data.md): upstream text data layout.
-- [Algorithm Manual](docs/algorithm.md): lookup pipeline, timeout model, name canonicalization, task recovery, and third-party code.
+- [Algorithm Manual](docs/algorithm.md): lookup pipeline, SVG diagram generation, timeout model, name canonicalization, task recovery, and third-party code.
 - [API Manual](docs/api.md): HTTP endpoints, WebSocket updates, and response shapes.
 
 ## Citation
