@@ -457,6 +457,28 @@ export default {
       const nextZoom = Math.min(8, Math.max(0.25, this.diagramViewerZoom * delta));
       this.diagramViewerZoom = Number(nextZoom.toFixed(3));
     },
+    diagramDownloadFileName() {
+      const firstName = (this.knot_name_list || "")
+        .split(/[,\s]+/)
+        .find(item => item && item !== "..." && item !== "NOT_FOUND");
+      const baseName = (firstName || "pd-diagram")
+        .replace(/[^A-Za-z0-9._-]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+      return `${baseName || "pd-diagram"}-diagram.svg`;
+    },
+    downloadDiagramSvg() {
+      if (!this.knot_pd_diagram_svg) return;
+      const blob = new Blob([this.knot_pd_diagram_svg], { type: "image/svg+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = this.diagramDownloadFileName();
+      link.style.display = "none";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
     wheelDiagramViewer(event) {
       const delta = event.deltaY < 0 ? 1.12 : 0.89;
       this.zoomDiagramViewer(delta);
@@ -631,6 +653,7 @@ export default {
         <span class="pd-diagram-viewer-zoom">{{ Math.round(diagramViewerZoom * 100) }}%</span>
         <button type="button" class="btn btn-outline-light btn-sm" aria-label="Zoom in" @click="zoomDiagramViewer(1.25)">+</button>
         <button type="button" class="btn btn-outline-light btn-sm" @click="resetDiagramViewer">Reset</button>
+        <button type="button" class="btn btn-outline-light btn-sm" @click="downloadDiagramSvg">Download</button>
         <button type="button" class="btn btn-light btn-sm" @click="closeDiagramViewer">Close</button>
       </div>
       <div
