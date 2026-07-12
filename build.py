@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 
@@ -19,6 +20,7 @@ VENDOR = ROOT / "third_party" / "cpp_knot_indexer"
 PD_CODE_TO_DIAGRAM = ROOT / "third_party" / "pd_code_to_diagram" / "cpp_src"
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET_NAME = "knot_indexer_lab_server" + EXE_SUFFIX
+VCS_METADATA_DIRS = {".git", ".hg", ".svn"}
 
 SERVER_SOURCES = [
     ROOT / "src" / "server" / "main.cpp",
@@ -53,6 +55,84 @@ def run_quiet(cmd: list[str], timeout: int = 30) -> subprocess.CompletedProcess[
         text=True,
         timeout=timeout,
     )
+
+
+def is_vcs_metadata_path(relative: Path) -> bool:
+    return any(part in VCS_METADATA_DIRS for part in relative.parts)
+
+
+def package_file_list() -> list[Path]:
+    cmd = [
+        "git",
+        "-C",
+        str(ROOT),
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as exc:
+        raise SystemExit(f"ERROR: git is required to package with .gitignore rules: {exc}") from exc
+
+    if proc.returncode != 0:
+        error = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise SystemExit(f"ERROR: failed to collect package files with git ls-files: {error}")
+
+    files: list[Path] = []
+    seen: set[str] = set()
+    for raw_name in proc.stdout.split(b"\0"):
+        if not raw_name:
+            continue
+        relative_text = raw_name.decode("utf-8", errors="surrogateescape")
+        relative = Path(relative_text)
+        relative_key = relative.as_posix()
+        if relative.is_absolute() or ".." in relative.parts:
+            raise SystemExit(f"ERROR: unsafe package path reported by git: {relative_text}")
+        if relative_key in seen or is_vcs_metadata_path(relative):
+            continue
+        source = ROOT / relative
+        if source.is_file():
+            files.append(relative)
+            seen.add(relative_key)
+
+    return sorted(files, key=lambda path: path.as_posix())
+
+
+def package_project(output: Path) -> None:
+    output = output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        output_relative = output.relative_to(ROOT)
+    except ValueError:
+        output_relative = None
+
+    files = package_file_list()
+    written = 0
+    with zipfile.ZipFile(
+        output,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        strict_timestamps=False,
+    ) as archive:
+        for relative in files:
+            if output_relative is not None and relative == output_relative:
+                continue
+            archive.write(ROOT / relative, (Path(ROOT.name) / relative).as_posix())
+            written += 1
+
+    print(f"INFO: packaged {written} files into {output}")
 
 
 def compiler_version(cxx: list[str]) -> str:
@@ -219,7 +299,13 @@ def copy_runtime_assets(build_dir: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the pure C++ knot-indexer-lab server.")
+    parser = argparse.ArgumentParser(description="Build or package the pure C++ knot-indexer-lab server.")
+    parser.add_argument("--package", action="store_true", help="Create a source zip archive instead of building.")
+    parser.add_argument(
+        "--package-output",
+        default=str(ROOT / "build" / f"{ROOT.name}.zip"),
+        help="Zip output path used with --package.",
+    )
     parser.add_argument("--cxx", help="C++ compiler command, for example g++ or clang++.")
     parser.add_argument("--build-dir", default=str(ROOT / "build"), help="Build output directory.")
     parser.add_argument("--output", help="Output executable path.")
@@ -237,6 +323,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.package:
+        package_project(Path(args.package_output))
+        return 0
+
     cxx = find_compiler(args.cxx)
     version = compiler_version(cxx).splitlines()[0]
 
