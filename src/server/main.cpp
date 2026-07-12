@@ -14,6 +14,7 @@
 #include "homfly_backend.hpp"
 #include "khovanov_backend.hpp"
 #include "link_pd_code.hpp"
+#include "name_pd_lookup.hpp"
 #include "pd_code.hpp"
 #include "pd_simplify_backend.hpp"
 #include "path_utils.hpp"
@@ -130,6 +131,7 @@ struct DataPaths {
     std::filesystem::path homflyDb;
     std::filesystem::path khovanovDb;
     std::filesystem::path knotNameRegDir;
+    std::filesystem::path primePdDb;
 };
 
 struct Request {
@@ -274,10 +276,12 @@ std::optional<DataPaths> tryResolveDataFolder(const std::filesystem::path& folde
     const std::filesystem::path homflyDb = folder / "homfly" / "sorted_HOMFLY-PT.txt";
     const std::filesystem::path khovanovDb = folder / "khovanov" / "sorted_khovanov.txt";
     const std::filesystem::path knotNameRegDir = folder / "knotname-reg";
-    if (!existsPath(homflyDb) || !existsPath(khovanovDb) || !isDirectory(knotNameRegDir)) {
+    const std::filesystem::path primePdDb = folder / "name-pd" / "prime_knots_3-11.txt";
+    if (!existsPath(homflyDb) || !existsPath(khovanovDb) || !isDirectory(knotNameRegDir) ||
+        !existsPath(primePdDb)) {
         return std::nullopt;
     }
-    return DataPaths{folder, homflyDb, khovanovDb, knotNameRegDir};
+    return DataPaths{folder, homflyDb, khovanovDb, knotNameRegDir, primePdDb};
 }
 
 DataPaths resolveDataFolder(const std::filesystem::path& executable, const std::filesystem::path& userFolder) {
@@ -1686,6 +1690,7 @@ public:
           timeoutSeconds_(timeoutSeconds),
           maxCrossing_(maxCrossing),
           nameNormalizer_(dataPaths_.knotNameRegDir),
+          namePdLookup_(dataPaths_.primePdDb),
           homflyIndex_(hki::loadInvariantMap(dataPaths_.homflyDb, nameNormalizer_)),
           khovanovIndex_(hki::loadInvariantMap(dataPaths_.khovanovDb, nameNormalizer_)) {}
 
@@ -1723,15 +1728,16 @@ public:
             error = *crossingError;
             return std::nullopt;
         }
-        error = "name-to-PD lookup is unavailable in the upstream text invariant data mode.";
-        return std::nullopt;
+        const std::string canonicalName = nameNormalizer_.normalize(normalizeNameSyntax(knotName));
+        return namePdLookup_.lookup(canonicalName, error);
     }
 
     std::string nameIndexStatus() const {
         return "Invariant data source: text files " +
                cki::platform::displayPath(dataPaths_.homflyDb) + " and " +
                cki::platform::displayPath(dataPaths_.khovanovDb) +
-               "\nName normalization data: " + cki::platform::displayPath(dataPaths_.knotNameRegDir);
+               "\nName normalization data: " + cki::platform::displayPath(dataPaths_.knotNameRegDir) +
+               "\nName-to-PD data: " + namePdLookup_.statusMessage();
     }
 
     int maxCrossing() const {
@@ -1744,6 +1750,7 @@ private:
     int timeoutSeconds_ = kMaxComputeTimeoutSeconds;
     int maxCrossing_ = kDefaultMaxCrossing;
     hki::NameNormalizer nameNormalizer_;
+    NamePdLookup namePdLookup_;
     hki::InvariantMap homflyIndex_;
     hki::InvariantMap khovanovIndex_;
     std::mutex cacheMutex_;

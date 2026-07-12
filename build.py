@@ -293,7 +293,7 @@ def copy_runtime_assets(build_dir: Path) -> None:
     if data_target.exists():
         shutil.rmtree(data_target)
     data_target.mkdir(parents=True, exist_ok=True)
-    for name in ["homfly", "khovanov", "knotname-reg"]:
+    for name in ["homfly", "khovanov", "knotname-reg", "name-pd"]:
         copy_runtime_tree(ROOT / "data" / name, data_target / name)
     copy_runtime_tree(ROOT / "web", build_dir / "web")
 

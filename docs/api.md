@@ -14,8 +14,10 @@ POST /api/index_coord_3d
 These endpoints create a computation task and return a lookup result object.
 The coordinate endpoint accepts JSON with a `coord_3d` string.
 
-`/api/index_knot_name` is currently unavailable because the upstream text data
-mode does not include name-to-PD records. It returns a clear error response.
+`/api/index_knot_name` resolves standard prime names such as `K11n185`, mirror
+names such as `mK7a7`, and comma-separated connected sums such as
+`K3a1,mK5a2`. It then runs the same invariant and candidate lookup pipeline as
+a PD-code request.
 
 ## Direct Conversion Endpoints
 
@@ -28,8 +30,8 @@ POST /api/coord_3d2pd_code
 ```
 
 `/api/coord_3d2pd_code` accepts JSON with a `coord_3d` string.
-`/api/knot_name2pd_code` is unavailable for the same reason as
-`/api/index_knot_name`.
+`/api/knot_name2pd_code` performs only the pure C++ name-to-PD conversion and
+returns the resulting PD code without computing invariants.
 
 ## Task Endpoints
 

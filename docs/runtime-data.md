@@ -1,8 +1,8 @@
 # Runtime Data Manual
 
-The server now uses the upstream `cpp_knot_indexer` text data layout. SQLite,
-PD_m name-to-PD data, and generated invariant index build modes are not
-supported in this version.
+The server uses the upstream `cpp_knot_indexer` text invariant layout together
+with a compact prime-knot PD table. SQLite, the pre-expanded PD_m database, and
+generated invariant index build modes are not needed.
 
 ## Layout
 
@@ -12,6 +12,7 @@ A valid runtime data folder contains:
 data/homfly/sorted_HOMFLY-PT.txt
 data/khovanov/sorted_khovanov.txt
 data/knotname-reg/
+data/name-pd/prime_knots_3-11.txt
 ```
 
 `build.py` copies `data/` beside the generated server executable. You can also
@@ -33,9 +34,16 @@ For PD-code and 3D-coordinate requests, the server computes HOMFLY-PT and
 Khovanov invariants, then searches the upstream text maps for candidate knot
 names.
 
-Name-to-PD lookup is unavailable in this data mode because the upstream text
-data does not include a PD-code table. The related HTTP endpoint returns a
-clear error instead of falling back to PD_m or SQLite.
+For name requests, the server normalizes each comma-separated factor and looks
+up its non-mirror prime PD code. A leading `m` mirrors that factor by swapping
+the second and fourth arc positions at each crossing. The C++ connected-sum
+implementation cuts one oriented arc in each diagram, cross-connects the
+endpoints, and canonically renumbers the combined PD code.
+
+The table covers all standard prime knots with 3 through 11 crossings, which
+matches the prime knots referenced by the bundled invariant maps. `K0a1`
+resolves to the empty PD code. Composite knots can have a larger total crossing
+number as long as they remain within `--max-crossing`.
 
 ## Crossing Limit
 
@@ -45,5 +53,6 @@ crossing numbers. Mirror prefixes do not change the crossing number.
 
 ## Git Policy
 
-The upstream text files are small enough to vendor with the project. Large
-local PD_m and SQLite files are ignored and are not used by this runtime mode.
+The text invariant files and compact prime table are small enough to vendor
+with the project. Large local PD_m and SQLite files are ignored and are not
+used by this runtime mode.

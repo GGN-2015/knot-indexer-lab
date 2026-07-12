@@ -40,6 +40,19 @@ accepts values up to 16. Prime factors use the number after `K`, and composite
 names sum all comma-separated factors. Mirror prefixes do not change the
 crossing number.
 
+## Name-To-PD Lookup
+
+The runtime prime table contains all 801 standard prime knots with 3 through
+11 crossings. The C++ loader validates every PD record and stores only the
+non-mirror representative.
+
+For each normalized factor, a leading `m` mirrors the prime diagram by swapping
+the second and fourth entries of every PD crossing. To combine factors, the
+server follows an oriented component cycle, cuts one arc in each diagram,
+cross-connects the two pairs of endpoints, and renumbers the resulting single
+component. Repeating this operation constructs the requested connected sum
+without pre-generating a combinatorial database of composite knots.
+
 ## SVG Diagram Generation
 
 Every successful lookup response includes an SVG diagram generated from the
@@ -77,8 +90,7 @@ red text so they remain readable over strands.
 
 Knot names are normalized by the upstream `NameNormalizer`. Legacy names from
 `name_pair.txt`, mirror rules from `need_mirror.txt`, and amphichiral entries
-from `amphichiral_list.txt` are applied before composite factors are sorted and
-deduplicated.
+from `amphichiral_list.txt` are applied before composite factors are sorted.
 
 ## Browser Task Recovery
 

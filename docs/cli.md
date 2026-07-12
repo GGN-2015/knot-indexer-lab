@@ -128,11 +128,13 @@ The runtime data folder uses the upstream text layout:
 homfly/sorted_HOMFLY-PT.txt
 khovanov/sorted_khovanov.txt
 knotname-reg/
+name-pd/prime_knots_3-11.txt
 ```
 
 SQLite, PD_m, and generated invariant index commands are not supported in this
-version. PD-code and 3D-coordinate lookup still compute invariants and search
-the upstream text maps. Name-to-PD lookup is unavailable in this data mode.
+version. Name lookup uses the prime PD table plus pure C++ mirror and connected
+sum operations. PD-code and 3D-coordinate lookup compute invariants and search
+the upstream text maps as before.
 
 ## Windows Notes
 

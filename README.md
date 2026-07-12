@@ -57,13 +57,15 @@ Runtime lookup data uses the upstream `cpp_knot_indexer` text layout:
 data/homfly/sorted_HOMFLY-PT.txt
 data/khovanov/sorted_khovanov.txt
 data/knotname-reg/
+data/name-pd/prime_knots_3-11.txt
 ```
 
-`build.py` copies this `data/` folder beside the executable. SQLite and PD_m
-index build modes are not supported in this version. Name-to-PD lookup is
-unavailable until a compatible upstream text data source exists again; PD and
-3D-coordinate lookup continue to retrieve candidate names from HOMFLY-PT and
-Khovanov text tables.
+`build.py` copies this `data/` folder beside the executable. Name-to-PD lookup
+loads the compact prime-knot table in C++, applies mirror transformations for
+`mK...` factors, and constructs comma-separated composite knots with connected
+sums. SQLite and the large pre-expanded PD_m database are not needed. PD and
+3D-coordinate lookup continue to retrieve candidate names from the HOMFLY-PT
+and Khovanov text tables.
 
 On Windows, replace `build/knot_indexer_lab_server` with
 `.\build\knot_indexer_lab_server.exe`.
