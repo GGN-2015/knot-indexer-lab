@@ -2730,16 +2730,16 @@ std::vector<int> alexander_determinant_fingerprint(const PDCode& raw_code) {
         }
 
         const int minor_size = std::min(rows, columns) - 1;
-        std::vector<std::vector<int>> minor(
+        std::vector<std::vector<int>> minor_matrix(
             static_cast<std::size_t>(minor_size),
             std::vector<int>(static_cast<std::size_t>(minor_size), 0));
         for (int row = 0; row < minor_size; ++row) {
             for (int column = 0; column < minor_size; ++column) {
-                minor[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)] =
+                minor_matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)] =
                     matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)];
             }
         }
-        fingerprint.push_back(determinant_mod_prime(std::move(minor), modulus));
+        fingerprint.push_back(determinant_mod_prime(std::move(minor_matrix), modulus));
     }
     return fingerprint;
 }
@@ -2885,7 +2885,7 @@ std::vector<int> alexander_roots_mod_prime(
         if (options != nullptr) {
             check_timeout(*options);
         }
-        std::vector<std::vector<int>> minor(
+        std::vector<std::vector<int>> minor_matrix(
             static_cast<std::size_t>(minor_size),
             std::vector<int>(static_cast<std::size_t>(minor_size), 0));
         for (int row = 0; row < minor_size; ++row) {
@@ -2896,7 +2896,7 @@ std::vector<int> alexander_roots_mod_prime(
                     return;
                 }
                 int& entry =
-                    minor[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)];
+                    minor_matrix[static_cast<std::size_t>(row)][static_cast<std::size_t>(column)];
                 entry = positive_mod(entry + value, modulus);
             };
             if (spec.sign == 1) {
@@ -2909,7 +2909,8 @@ std::vector<int> alexander_roots_mod_prime(
                 add_value(spec.under_out, t);
             }
         }
-        if (alexander_determinant_guard::determinant_mod_prime(std::move(minor), modulus) == 0) {
+        if (alexander_determinant_guard::determinant_mod_prime(
+                std::move(minor_matrix), modulus) == 0) {
             roots.push_back(t);
         }
     }
