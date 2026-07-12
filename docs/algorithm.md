@@ -59,12 +59,14 @@ extra turns, unsupported local topology, and open endpoints. This keeps the
 output stable while avoiding a visibly worse first layout when a better seed is
 available.
 
-SVG strands are drawn as vector paths on a white background. Quarter-turn tiles
-use the outward-bulging orientation relative to the local bend, so the visible
-strand rounds around the outside of the turn instead of cutting into the
-diagram interior. Crossings are drawn in two layers: the under-strand is drawn
-first, a white gap masks the crossing center, and the over-strand is drawn on
-top.
+SVG strands are drawn as vector paths on a white background. Positive matrix
+cells are first traced into continuous arc paths, so a strand is emitted as one
+`M/L/A` SVG path instead of many disconnected tile fragments. Straight runs use
+`L` commands. Every 90-degree turn uses an SVG circular `A` command with radius
+equal to half a tile, which makes the arc tangent to the adjacent horizontal and
+vertical straight segments. Crossings are drawn in two layers: the under-strand
+is drawn first, a white gap masks the crossing center, and the over-strand is
+drawn on top.
 
 Each crossing also renders the four adjacent arc numbers around the crossing.
 The labels are taken directly from the neighboring positive matrix cells: top,

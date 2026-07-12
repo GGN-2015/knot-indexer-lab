@@ -1001,6 +1001,11 @@ constexpr int kDiagramRight = 1 << 1;
 constexpr int kDiagramBottom = 1 << 2;
 constexpr int kDiagramLeft = 1 << 3;
 
+struct SvgPoint {
+    double x = 0.0;
+    double y = 0.0;
+};
+
 struct DiagramMatrixBounds {
     int minRow = 0;
     int minCol = 0;
@@ -1134,6 +1139,44 @@ int diagramBitCount4(int mask) {
     return count;
 }
 
+std::vector<int> diagramMaskDirections(int mask) {
+    std::vector<int> dirs;
+    for (int bit : {kDiagramTop, kDiagramRight, kDiagramBottom, kDiagramLeft}) {
+        if (mask & bit) dirs.push_back(bit);
+    }
+    return dirs;
+}
+
+int diagramOppositeDirection(int direction) {
+    switch (direction) {
+        case kDiagramTop: return kDiagramBottom;
+        case kDiagramRight: return kDiagramLeft;
+        case kDiagramBottom: return kDiagramTop;
+        case kDiagramLeft: return kDiagramRight;
+        default: return 0;
+    }
+}
+
+int diagramDirectionIndex(int direction) {
+    switch (direction) {
+        case kDiagramTop: return 0;
+        case kDiagramRight: return 1;
+        case kDiagramBottom: return 2;
+        case kDiagramLeft: return 3;
+        default: return -1;
+    }
+}
+
+std::pair<int, int> diagramStepCell(int row, int col, int direction) {
+    switch (direction) {
+        case kDiagramTop: return {row - 1, col};
+        case kDiagramRight: return {row, col + 1};
+        case kDiagramBottom: return {row + 1, col};
+        case kDiagramLeft: return {row, col - 1};
+        default: return {row, col};
+    }
+}
+
 int diagramLineMask(const IntMatrix& matrix, int row, int col) {
     const int val = matrix.getPos(row, col);
     if (val <= 0) return 0;
@@ -1258,19 +1301,39 @@ void appendSvgLine(std::ostringstream& svg,
         << "\" y2=\"" << svgNumber(y2) << "\"/>\n";
 }
 
-void appendSvgCorner(std::ostringstream& svg,
-                     double sx,
-                     double sy,
-                     double c1x,
-                     double c1y,
-                     double c2x,
-                     double c2y,
-                     double ex,
-                     double ey) {
-    svg << "<path class=\"strand\" d=\"M " << svgNumber(sx) << " " << svgNumber(sy)
-        << " C " << svgNumber(c1x) << " " << svgNumber(c1y)
-        << " " << svgNumber(c2x) << " " << svgNumber(c2y)
-        << " " << svgNumber(ex) << " " << svgNumber(ey) << "\"/>\n";
+SvgPoint diagramPortPoint(double x, double y, double tile, int direction) {
+    const double midX = x + tile / 2.0;
+    const double midY = y + tile / 2.0;
+    switch (direction) {
+        case kDiagramTop: return {midX, y};
+        case kDiagramRight: return {x + tile, midY};
+        case kDiagramBottom: return {midX, y + tile};
+        case kDiagramLeft: return {x, midY};
+        default: return {midX, midY};
+    }
+}
+
+int diagramArcSweepFlag(int entryDirection, int exitDirection) {
+    const int entryIndex = diagramDirectionIndex(entryDirection);
+    const int exitIndex = diagramDirectionIndex(exitDirection);
+    if (entryIndex < 0 || exitIndex < 0) return 0;
+    return exitIndex == (entryIndex + 1) % 4 ? 0 : 1;
+}
+
+void appendSvgCornerArc(std::ostringstream& svg,
+                        double x,
+                        double y,
+                        double tile,
+                        int entryDirection,
+                        int exitDirection) {
+    const SvgPoint start = diagramPortPoint(x, y, tile, entryDirection);
+    const SvgPoint end = diagramPortPoint(x, y, tile, exitDirection);
+    const double radius = tile / 2.0;
+    const int sweep = diagramArcSweepFlag(entryDirection, exitDirection);
+    svg << "<path class=\"strand\" d=\"M " << svgNumber(start.x) << " " << svgNumber(start.y)
+        << " A " << svgNumber(radius) << " " << svgNumber(radius)
+        << " 0 0 " << sweep
+        << " " << svgNumber(end.x) << " " << svgNumber(end.y) << "\"/>\n";
 }
 
 void appendSvgRegularTile(std::ostringstream& svg,
@@ -1282,24 +1345,20 @@ void appendSvgRegularTile(std::ostringstream& svg,
                           double tile) {
     const double midX = x + tile / 2.0;
     const double midY = y + tile / 2.0;
-    const double nearX = x + tile * 0.18;
-    const double farX = x + tile * 0.82;
-    const double nearY = y + tile * 0.18;
-    const double farY = y + tile * 0.82;
     const int mask = diagramLineMask(matrix, row, col);
 
     switch (mask) {
         case kDiagramTop | kDiagramRight:
-            appendSvgCorner(svg, midX, y, midX, farY, nearX, midY, x + tile, midY);
+            appendSvgCornerArc(svg, x, y, tile, kDiagramTop, kDiagramRight);
             return;
         case kDiagramRight | kDiagramBottom:
-            appendSvgCorner(svg, x + tile, midY, nearX, midY, midX, nearY, midX, y + tile);
+            appendSvgCornerArc(svg, x, y, tile, kDiagramRight, kDiagramBottom);
             return;
         case kDiagramBottom | kDiagramLeft:
-            appendSvgCorner(svg, midX, y + tile, midX, nearY, farX, midY, x, midY);
+            appendSvgCornerArc(svg, x, y, tile, kDiagramBottom, kDiagramLeft);
             return;
         case kDiagramLeft | kDiagramTop:
-            appendSvgCorner(svg, x, midY, farX, midY, midX, farY, midX, y);
+            appendSvgCornerArc(svg, x, y, tile, kDiagramLeft, kDiagramTop);
             return;
         case kDiagramTop | kDiagramBottom:
             appendSvgLine(svg, midX, y, midX, y + tile);
@@ -1315,6 +1374,141 @@ void appendSvgRegularTile(std::ostringstream& svg,
     if (mask & kDiagramRight) appendSvgLine(svg, midX, midY, x + tile, midY);
     if (mask & kDiagramBottom) appendSvgLine(svg, midX, midY, midX, y + tile);
     if (mask & kDiagramLeft) appendSvgLine(svg, midX, midY, x, midY);
+}
+
+bool isTraceableDiagramCell(const IntMatrix& matrix, int row, int col) {
+    if (matrix.getPos(row, col) <= 0) return false;
+    const int mask = diagramLineMask(matrix, row, col);
+    return diagramBitCount4(mask) == 2 &&
+           (isDiagramStraightMask(mask) || isDiagramCornerMask(mask));
+}
+
+bool sameTraceableDiagramArcNeighbor(const IntMatrix& matrix,
+                                     int row,
+                                     int col,
+                                     int direction) {
+    const int value = matrix.getPos(row, col);
+    if (value <= 0) return false;
+    const auto next = diagramStepCell(row, col, direction);
+    if (matrix.getPos(next.first, next.second) != value) return false;
+    return isTraceableDiagramCell(matrix, next.first, next.second);
+}
+
+int otherTraceDirection(const IntMatrix& matrix, int row, int col, int entryDirection) {
+    const std::vector<int> dirs = diagramMaskDirections(diagramLineMask(matrix, row, col));
+    if (dirs.size() != 2) return 0;
+    if (dirs[0] == entryDirection) return dirs[1];
+    if (dirs[1] == entryDirection) return dirs[0];
+    return 0;
+}
+
+struct DiagramTraceCursor {
+    int row = 0;
+    int col = 0;
+    int entryDirection = 0;
+};
+
+DiagramTraceCursor rewindDiagramTraceStart(const IntMatrix& matrix,
+                                           int row,
+                                           int col,
+                                           int entryDirection) {
+    DiagramTraceCursor cursor{row, col, entryDirection};
+    const int guardLimit = std::max(4, matrix.getRowCnt() * matrix.getColCnt() + 4);
+    std::set<std::tuple<int, int, int>> seen;
+
+    for (int guard = 0; guard < guardLimit; ++guard) {
+        const auto state = std::make_tuple(cursor.row, cursor.col, cursor.entryDirection);
+        if (!seen.insert(state).second) break;
+        if (!sameTraceableDiagramArcNeighbor(matrix, cursor.row, cursor.col, cursor.entryDirection)) break;
+
+        const auto prev = diagramStepCell(cursor.row, cursor.col, cursor.entryDirection);
+        const int connectedSide = diagramOppositeDirection(cursor.entryDirection);
+        const int previousEntry = otherTraceDirection(matrix, prev.first, prev.second, connectedSide);
+        if (previousEntry == 0) break;
+        cursor = DiagramTraceCursor{prev.first, prev.second, previousEntry};
+    }
+
+    return cursor;
+}
+
+void appendSvgTraceSegment(std::ostringstream& path,
+                           double x,
+                           double y,
+                           double tile,
+                           int entryDirection,
+                           int exitDirection) {
+    const SvgPoint end = diagramPortPoint(x, y, tile, exitDirection);
+    if ((entryDirection == kDiagramTop && exitDirection == kDiagramBottom) ||
+        (entryDirection == kDiagramBottom && exitDirection == kDiagramTop) ||
+        (entryDirection == kDiagramLeft && exitDirection == kDiagramRight) ||
+        (entryDirection == kDiagramRight && exitDirection == kDiagramLeft)) {
+        path << " L " << svgNumber(end.x) << " " << svgNumber(end.y);
+        return;
+    }
+
+    const double radius = tile / 2.0;
+    const int sweep = diagramArcSweepFlag(entryDirection, exitDirection);
+    path << " A " << svgNumber(radius) << " " << svgNumber(radius)
+         << " 0 0 " << sweep
+         << " " << svgNumber(end.x) << " " << svgNumber(end.y);
+}
+
+void appendSvgRegularTracedPaths(std::ostringstream& svg,
+                                 const IntMatrix& matrix,
+                                 const DiagramMatrixBounds& bounds,
+                                 double padding,
+                                 double tile,
+                                 std::set<std::pair<int, int>>& tracedCells) {
+    for (int row = bounds.minRow; row <= bounds.maxRow; ++row) {
+        for (int col = bounds.minCol; col <= bounds.maxCol; ++col) {
+            if (!isTraceableDiagramCell(matrix, row, col)) continue;
+            if (tracedCells.count({row, col})) continue;
+
+            const std::vector<int> dirs = diagramMaskDirections(diagramLineMask(matrix, row, col));
+            if (dirs.size() != 2) continue;
+            DiagramTraceCursor cursor = rewindDiagramTraceStart(matrix, row, col, dirs[0]);
+            if (tracedCells.count({cursor.row, cursor.col})) {
+                cursor = rewindDiagramTraceStart(matrix, row, col, dirs[1]);
+            }
+            if (tracedCells.count({cursor.row, cursor.col})) continue;
+
+            const double startX = padding + static_cast<double>(cursor.col - bounds.minCol) * tile;
+            const double startY = padding + static_cast<double>(cursor.row - bounds.minRow) * tile;
+            const SvgPoint start = diagramPortPoint(startX, startY, tile, cursor.entryDirection);
+
+            std::ostringstream path;
+            path << "M " << svgNumber(start.x) << " " << svgNumber(start.y);
+            bool wroteSegment = false;
+
+            const int guardLimit = std::max(4, matrix.getRowCnt() * matrix.getColCnt() + 4);
+            for (int guard = 0; guard < guardLimit; ++guard) {
+                if (!isTraceableDiagramCell(matrix, cursor.row, cursor.col)) break;
+                if (tracedCells.count({cursor.row, cursor.col})) break;
+                tracedCells.insert({cursor.row, cursor.col});
+
+                const int exitDirection = otherTraceDirection(matrix, cursor.row, cursor.col, cursor.entryDirection);
+                if (exitDirection == 0) break;
+
+                const double x = padding + static_cast<double>(cursor.col - bounds.minCol) * tile;
+                const double y = padding + static_cast<double>(cursor.row - bounds.minRow) * tile;
+                appendSvgTraceSegment(path, x, y, tile, cursor.entryDirection, exitDirection);
+                wroteSegment = true;
+
+                if (!sameTraceableDiagramArcNeighbor(matrix, cursor.row, cursor.col, exitDirection)) break;
+                const auto next = diagramStepCell(cursor.row, cursor.col, exitDirection);
+                if (tracedCells.count({next.first, next.second})) break;
+                cursor = DiagramTraceCursor{
+                    next.first,
+                    next.second,
+                    diagramOppositeDirection(exitDirection),
+                };
+            }
+
+            if (wroteSegment) {
+                svg << "<path class=\"strand\" d=\"" << path.str() << "\"/>\n";
+            }
+        }
+    }
 }
 
 void appendSvgCrossingTile(std::ostringstream& svg,
@@ -1426,10 +1620,14 @@ std::string renderPdMatrixSvg(const IntMatrix& matrix, const std::string& title)
         << "paint-order:stroke fill;stroke-linejoin:round}"
         << "</style>\n";
 
+    std::set<std::pair<int, int>> tracedCells;
+    appendSvgRegularTracedPaths(svg, matrix, bounds, padding, tile, tracedCells);
+
     for (int row = bounds.minRow; row <= bounds.maxRow; ++row) {
         for (int col = bounds.minCol; col <= bounds.maxCol; ++col) {
             const int value = matrix.getPos(row, col);
             if (value <= 0) continue;
+            if (tracedCells.count({row, col})) continue;
             const double x = padding + static_cast<double>(col - bounds.minCol) * tile;
             const double y = padding + static_cast<double>(row - bounds.minRow) * tile;
             appendSvgRegularTile(svg, matrix, row, col, x, y, tile);
