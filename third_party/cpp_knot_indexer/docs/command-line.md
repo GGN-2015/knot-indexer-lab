@@ -43,38 +43,14 @@ timeouts. Negative values are rejected.
 
 `--data-folder PATH`
 
-Use an explicit invariant database folder. A valid data folder must contain
-`knotname-reg/` and at least one invariant data source.
-
-Text invariant data source:
+Use an explicit invariant database folder. A valid data folder must contain:
 
 - `homfly/sorted_HOMFLY-PT.txt`
 - `khovanov/sorted_khovanov.txt`
-
-SQLite invariant data source:
-
-- `knot-index.sqlite`
-- `knot_index.sqlite`
-- `invariants.sqlite`
-- `name-pd/PD_m_3-16.sqlite`
+- `knotname-reg/`
 
 When this option is present, the executable does not search default data folder
 locations. The folder name itself does not have to be `data`.
-
-`--sqlite-db PATH`
-
-Use an explicit SQLite invariant database. This overrides SQLite auto-detection
-inside the data folder, but the executable still needs a valid data folder for
-`knotname-reg/`.
-
-The SQLite database must contain an `invariants` table with these text columns:
-
-- `name`
-- `homfly`
-- `khovanov`
-
-The table may also contain `canonical_pd`, matching the SQLite database
-produced by `knot-indexer-lab`.
 
 `--ban-simplify`
 
@@ -102,8 +78,8 @@ Print command usage.
 
 On Windows, all executables read command line arguments from the native Unicode
 command line instead of relying on the narrow `argv` code page. This means paths
-passed to `--pd-file`, `--data-folder`, `--sqlite-db`, `--input`, and `--output`
-work whether the invoking shell is using a GBK-compatible code page or UTF-8.
+passed to `--pd-file`, `--data-folder`, `--input`, and `--output` work whether
+the invoking shell is using a GBK-compatible code page or UTF-8.
 
 On Linux and macOS, paths are passed through as the native byte strings provided
 by the shell. UTF-8 paths are supported as usual.
@@ -138,10 +114,6 @@ If `--data-folder` is not provided, the executable searches for a folder named
    `build/cpp_knot_indexer`
 
 If neither location is valid, the program exits with an error.
-
-SQLite files are auto-detected only inside a valid data folder. Text invariant
-files remain supported and are used as a fallback if SQLite is absent or has no
-matching invariant record.
 
 ## Internal Worker Options
 

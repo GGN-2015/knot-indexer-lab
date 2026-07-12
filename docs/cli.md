@@ -80,60 +80,26 @@ Server options:
 ```text
 --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0
 --port PORT          TCP port. Default: 5000
---data-folder PATH   Runtime folder containing name-pd/ and knotname-reg/
+--data-folder PATH   Runtime folder containing homfly/, khovanov/, and knotname-reg/
 --web-root PATH      Runtime web asset folder
 --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200
---build-sqlite       Import PD_m_3-16.sorted.txt into SQLite, then exit
---build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit
 --max-crossing N     Maximum total crossing number. Default: 14, max: 16
---index-limit N      Limit newly imported or indexed records in build modes
---index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores
---index-batch-size N SQLite invariant rows per write transaction. Default: 256
---index-progress-seconds N
-                     Progress/ETA refresh interval. Default: 5
 --help, -h           Show help text
 ```
 
-## Data Commands
+## Runtime Data
 
-Import the text name-to-PD database into SQLite:
+The runtime data folder uses the upstream text layout:
 
-```sh
-build/knot_indexer_lab_server --build-sqlite
+```text
+homfly/sorted_HOMFLY-PT.txt
+khovanov/sorted_khovanov.txt
+knotname-reg/
 ```
 
-If the existing SQLite file is malformed, `--build-sqlite` deletes the broken
-database and its WAL/SHM sidecar files, then rebuilds it from the text PD_m
-data.
-
-Build or extend the invariant index:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index
-```
-
-This command indexes only knots whose total crossing number is at most
-`--max-crossing`. The default is 14, and the largest accepted value is 16. For
-a composite name, the total is the sum of all comma-separated prime factors.
-
-Run a bounded smoke test:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index --index-limit 100
-```
-
-Tune a large SQLite invariant build:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
-```
-
-Each index worker launches HOMFLY-PT and Khovanov workers for the input PD
-code. The batch index builder does not run PD simplification, so set
-`--index-workers` according to available CPU and memory.
-
-You can pass `--build-sqlite` and `--build-pd-index` together to rebuild the
-SQLite name database first and then continue into invariant indexing.
+SQLite, PD_m, and generated invariant index commands are not supported in this
+version. PD-code and 3D-coordinate lookup still compute invariants and search
+the upstream text maps. Name-to-PD lookup is unavailable in this data mode.
 
 ## Windows Notes
 

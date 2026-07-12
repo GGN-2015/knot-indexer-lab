@@ -8,7 +8,6 @@ documented in the [Runtime Data Manual](runtime-data.md).
 
 The site supports:
 
-- lookup by knot name when a name-to-PD database is available
 - lookup by PD code
 - conversion from ordered 3D coordinates to PD code
 - task monitoring with cancellation for running computations
@@ -31,34 +30,22 @@ invariant if the other one fails or times out.
 
 ## Candidate Lookup
 
-Candidate lookup compares computed invariants against generated PD_m invariant
-records. SQLite is preferred when `PD_m_3-16.sqlite` exists. A TSV fallback is
-available when SQLite is not present.
+Candidate lookup compares computed invariants against the upstream text maps:
 
-Generated invariant records are limited by `--max-crossing`, which defaults to
-14 and accepts values up to 16. Prime factors use the number after `K`, and
-composite names sum all comma-separated factors. Mirror prefixes do not change
-the crossing number.
+- `data/homfly/sorted_HOMFLY-PT.txt`
+- `data/khovanov/sorted_khovanov.txt`
 
-The SQLite invariant builder is optimized for large PD_m data:
-
-- one producer pages unindexed records from SQLite
-- multiple compute workers run invariant calculations in parallel
-- batch workers compute directly from the stored PD_m PD code and do not run
-  PD simplification
-- one writer batches successful rows into SQLite transactions
-- progress output includes processed rows, written rows, failures, rate,
-  elapsed time, and `ETA HH:MM:SS`
-- secondary invariant indexes are rebuilt after a bulk build
-
-The builder does not derive Khovanov results from mirror knots.
+Candidate names are filtered by `--max-crossing`, which defaults to 14 and
+accepts values up to 16. Prime factors use the number after `K`, and composite
+names sum all comma-separated factors. Mirror prefixes do not change the
+crossing number.
 
 ## Name Canonicalization
 
-Knot names are canonicalized before lookup. Legacy names from `name_pair.txt`
-are mapped to modern `K...` names. Mirror names keep an `m` prefix unless the
-prime knot is listed in `amphichiral_list.txt`, in which case the `m` prefix is
-removed automatically. Composite knot factors are normalized and sorted.
+Knot names are normalized by the upstream `NameNormalizer`. Legacy names from
+`name_pair.txt`, mirror rules from `need_mirror.txt`, and amphichiral entries
+from `amphichiral_list.txt` are applied before composite factors are sorted and
+deduplicated.
 
 ## Browser Task Recovery
 
@@ -72,7 +59,6 @@ The `third_party/cpp_knot_indexer` tree is vendored from
 [`GGN-2015/cpp_knot_indexer`](https://github.com/GGN-2015/cpp_knot_indexer).
 It includes the HOMFLY-PT, Khovanov, and PD-code simplification
 implementations used by this server. This vendored copy was refreshed from
-upstream commit `d75a8e149a5332b7e7c5e0844139639682aba05d`.
+upstream commit `81ad3c3`.
 
-SQLite is vendored from the official amalgamation package and is compiled into
-the server. See the vendored licenses for details.
+The server no longer vendors or links SQLite.

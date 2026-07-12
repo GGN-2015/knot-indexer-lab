@@ -1,104 +1,49 @@
 # Runtime Data Manual
 
-The retrieval database is `PD_m_3-16.sorted.txt`, not the original
-`third_party/cpp_knot_indexer/data` folder. The vendored `cpp_knot_indexer`
-project is used for HOMFLY-PT, Khovanov, PD parsing, PD simplification, and
-coordinate-to-PD algorithms.
+The server now uses the upstream `cpp_knot_indexer` text data layout. SQLite,
+PD_m name-to-PD data, and generated invariant index build modes are not
+supported in this version.
 
 ## Layout
 
-Install the PD database at:
+A valid runtime data folder contains:
 
 ```text
-data/name-pd/PD_m_3-16.sorted.txt
+data/homfly/sorted_HOMFLY-PT.txt
+data/khovanov/sorted_khovanov.txt
+data/knotname-reg/
 ```
 
-Expected record format:
-
-```text
-[K3a1|[[1,5,2,4],[3,1,4,6],[5,3,6,2]]]
-```
-
-`build.py` copies this local `data/` folder to `build/data/` incrementally. The
-server includes a tiny fallback for `K0a1` and `K3a1`; broader name lookup needs
-`PD_m_3-16.sorted.txt` or the generated SQLite database.
-
-## SQLite Name Lookup
-
-For efficient lookup, first import the text database into SQLite:
+`build.py` copies `data/` beside the generated server executable. You can also
+pass an explicit folder at runtime:
 
 ```sh
-build/knot_indexer_lab_server --build-sqlite
+build/knot_indexer_lab_server --data-folder /path/to/data
 ```
 
-This creates:
+On Windows:
 
-```text
-data/name-pd/PD_m_3-16.sqlite
+```powershell
+.\build\knot_indexer_lab_server.exe --data-folder C:\path\to\data
 ```
 
-The server prefers SQLite when it exists. Without SQLite, it falls back to a
-streaming text-file index.
+## Lookup Behavior
 
-If the existing SQLite database is malformed, `--build-sqlite` automatically
-closes it, deletes the `.sqlite` file plus `-wal`, `-shm`, and `-journal`
-sidecar files, and rebuilds from `PD_m_3-16.sorted.txt`.
+For PD-code and 3D-coordinate requests, the server computes HOMFLY-PT and
+Khovanov invariants, then searches the upstream text maps for candidate knot
+names.
 
-## Invariant Index
+Name-to-PD lookup is unavailable in this data mode because the upstream text
+data does not include a PD-code table. The related HTTP endpoint returns a
+clear error instead of falling back to PD_m or SQLite.
 
-Candidate lookup by PD code uses generated invariant records:
+## Crossing Limit
 
-```sh
-build/knot_indexer_lab_server --build-pd-index
-```
-
-When `--build-sqlite` and `--build-pd-index` are used together, the SQLite
-name database is imported or rebuilt first, then invariant indexing starts.
-
-When `PD_m_3-16.sqlite` is present, invariant records are written into its
-`invariants` table. Otherwise, the fallback writer creates:
-
-```text
-data/name-pd/PD_m_3-16.invariants.tsv
-```
-
-SQLite invariant indexing is parallel by default. The builder streams
-unindexed records through a bounded work queue, computes HOMFLY-PT and Khovanov
-in multiple worker lanes, writes successful rows in SQLite transactions, and
-prints periodic progress with `ETA HH:MM:SS`.
-
-The invariant index is intentionally limited by `--max-crossing`. The default
-limit is 14, and the largest accepted value is 16. For composite knot names,
-factors are comma-separated and the total crossing number is the sum of the
-crossing numbers of all factors; with the default limit, `K3a1,K11a1` is
-included and `K5a2,K10n39` is not.
-
-The batch index builder computes invariants directly from the stored PD_m PD
-code. It does not run PD simplification because the PD_m records are expected
-to be already minimized for this build stage.
-
-Useful tuning options:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index --index-workers 8 --index-batch-size 512
-```
-
-For smoke tests or partial batches:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index --index-limit 100
-```
+Candidate names are filtered by `--max-crossing`, which defaults to 14 and
+accepts values up to 16. Composite names sum all comma-separated prime factor
+crossing numbers. Mirror prefixes do not change the crossing number.
 
 ## Git Policy
 
-The full PD_m data files are intentionally ignored by Git:
-
-```text
-data/name-pd/PD_m_3-16.sorted.txt
-data/name-pd/PD_m_3-16.sqlite
-data/name-pd/PD_m_3-16.invariants.tsv
-third_party/cpp_knot_indexer/data/
-```
-
-Keep these files local unless a separate large-file distribution process is
-used.
+The upstream text files are small enough to vendor with the project. Large
+local PD_m and SQLite files are ignored and are not used by this runtime mode.

@@ -2,25 +2,12 @@
 
 #include "path_utils.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
 
 namespace hki {
-
-struct CancellationToken {
-    std::atomic_bool requested{false};
-
-    void cancel() {
-        requested.store(true, std::memory_order_relaxed);
-    }
-
-    bool cancelled() const {
-        return requested.load(std::memory_order_relaxed);
-    }
-};
 
 struct WorkerResult {
     bool success = false;
@@ -37,12 +24,6 @@ WorkerResult runWorkerProcess(const std::filesystem::path& executable,
                               const std::string& workerName,
                               const std::string& input,
                               int timeoutSeconds);
-
-WorkerResult runWorkerProcess(const std::filesystem::path& executable,
-                              const std::string& workerName,
-                              const std::string& input,
-                              int timeoutSeconds,
-                              const std::shared_ptr<CancellationToken>& cancellation);
 
 class WorkerProcess;
 
@@ -360,23 +341,11 @@ inline WorkerResult runWorkerProcess(const std::filesystem::path& executable,
                               const std::string& workerName,
                               const std::string& input,
                               int timeoutSeconds) {
-    return runWorkerProcess(executable, workerName, input, timeoutSeconds, nullptr);
-}
-
-inline WorkerResult runWorkerProcess(const std::filesystem::path& executable,
-                              const std::string& workerName,
-                              const std::string& input,
-                              int timeoutSeconds,
-                              const std::shared_ptr<CancellationToken>& cancellation) {
     const auto deadline = timeoutSeconds > 0
         ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds)
         : std::chrono::steady_clock::time_point::max();
     std::unique_ptr<WorkerProcess> process = startWorkerProcess(executable, workerName, input);
     while (!pollWorkerProcess(*process, deadline)) {
-        if (cancellation && cancellation->cancelled()) {
-            cancelWorkerProcess(*process);
-            break;
-        }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return finishWorkerProcess(*process);

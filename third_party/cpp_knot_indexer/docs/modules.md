@@ -38,10 +38,9 @@ Use `#include "link_pd_code.hpp"` to consume the library directly. The matching
 `src/common`
 
 Small shared helpers used by command line entrypoints. `path_utils.hpp` provides
-native Unicode argv collection on Windows, UTF-8 diagnostic formatting, and the
-SQLite filename conversion used by the main indexer. The public algorithm
-headers do not require this directory unless an application wants to reuse the
-same CLI path behavior.
+native Unicode argv collection on Windows and UTF-8 diagnostic formatting. The
+public algorithm headers do not require this directory unless an application
+wants to reuse the same CLI path behavior.
 
 `third_party/cppkh`
 
@@ -56,11 +55,6 @@ with the main executable sources.
 
 Vendored MIT-licensed header-only PD-code simplifier from
 `GGN-2015/cpp-pd-code-simplify`.
-
-`third_party/sqlite`
-
-Vendored public-domain SQLite amalgamation used by the main executable when a
-SQLite invariant data source is available.
 
 `data`
 
@@ -77,11 +71,6 @@ Project documentation beyond the README QuickStart.
 
 Loads invariant-to-name maps and normalizes knot names through
 `knotname-reg`.
-
-`sqlite_database.hpp`
-
-Opens a read-only SQLite invariant database and queries the `invariants` table
-by HOMFLY-PT, Khovanov, or the pair of both invariants.
 
 `pd_code.hpp`
 

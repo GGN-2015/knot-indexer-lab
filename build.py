@@ -16,7 +16,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "third_party" / "cpp_knot_indexer"
-SQLITE = ROOT / "third_party" / "sqlite" / "sqlite-amalgamation-3530300"
 PD_CODE_TO_DIAGRAM = ROOT / "third_party" / "pd_code_to_diagram" / "cpp_src"
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET_NAME = "knot_indexer_lab_server" + EXE_SUFFIX
@@ -24,10 +23,6 @@ TARGET_NAME = "knot_indexer_lab_server" + EXE_SUFFIX
 SERVER_SOURCES = [
     ROOT / "src" / "server" / "main.cpp",
     VENDOR / "third_party" / "cppkh" / "cppkh_main.cpp",
-]
-
-SQLITE_SOURCES = [
-    SQLITE / "sqlite3.c",
 ]
 
 LIBHOMFLY_SOURCES = [
@@ -137,7 +132,6 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
     flags = ["-std=c++17"]
     flags += ["-O0", "-g"] if args.debug else ["-O3", "-DNDEBUG"]
     flags += ["-DCPPKH_SHARED_LIBRARY"]
-    flags += ["-DSQLITE_THREADSAFE=1", "-DSQLITE_OMIT_LOAD_EXTENSION"]
 
     system = platform.system().lower()
     if system == "windows":
@@ -149,7 +143,6 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
 
     flags += [
         "-I", str(ROOT / "src" / "server"),
-        "-I", str(SQLITE),
         "-I", str(VENDOR / "src" / "common"),
         "-I", str(VENDOR / "src" / "knot_indexer"),
         "-I", str(VENDOR / "src" / "link_pd_code"),
@@ -181,9 +174,6 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
 
 def source_args() -> list[str]:
     args = [str(path) for path in SERVER_SOURCES]
-    args += ["-x", "c"]
-    args += [str(path) for path in SQLITE_SOURCES]
-    args += ["-x", "c++"]
     args += [str(path) for path in LIBHOMFLY_SOURCES]
     args += ["-x", "none"]
     return args
@@ -221,9 +211,10 @@ def overlay_tree(source: Path, target: Path) -> None:
 def copy_runtime_assets(build_dir: Path) -> None:
     data_target = build_dir / "data"
     if data_target.exists():
-        overlay_tree(ROOT / "data", data_target)
-    else:
-        copy_runtime_tree(ROOT / "data", data_target)
+        shutil.rmtree(data_target)
+    data_target.mkdir(parents=True, exist_ok=True)
+    for name in ["homfly", "khovanov", "knotname-reg"]:
+        copy_runtime_tree(ROOT / "data" / name, data_target / name)
     copy_runtime_tree(ROOT / "web", build_dir / "web")
 
 

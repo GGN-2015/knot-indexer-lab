@@ -1,7 +1,7 @@
 # API Manual
 
 The web UI uses HTTP endpoints and a WebSocket task stream. Payloads embedded
-in the URL are base64url-encoded UTF-8 strings without required padding.
+in the URL are base64-encoded UTF-8 strings and then URL encoded.
 
 ## Lookup Endpoints
 
@@ -14,6 +14,9 @@ POST /api/index_coord_3d
 These endpoints create a computation task and return a lookup result object.
 The coordinate endpoint accepts JSON with a `coord_3d` string.
 
+`/api/index_knot_name` is currently unavailable because the upstream text data
+mode does not include name-to-PD records. It returns a clear error response.
+
 ## Direct Conversion Endpoints
 
 ```text
@@ -25,6 +28,8 @@ POST /api/coord_3d2pd_code
 ```
 
 `/api/coord_3d2pd_code` accepts JSON with a `coord_3d` string.
+`/api/knot_name2pd_code` is unavailable for the same reason as
+`/api/index_knot_name`.
 
 ## Task Endpoints
 

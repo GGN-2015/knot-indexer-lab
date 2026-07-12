@@ -6,7 +6,6 @@
 #include "path_utils.hpp"
 #include "process_runner.hpp"
 #include "runtime_control.hpp"
-#include "sqlite_database.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -45,7 +44,6 @@ namespace {
 struct Options {
     std::string pdText;
     std::filesystem::path dataFolder;
-    std::filesystem::path sqliteDb;
     int timeoutSeconds = 60;
     bool verbose = false;
     bool printInvariants = false;
@@ -56,8 +54,6 @@ struct DataPaths {
     std::filesystem::path homflyDb;
     std::filesystem::path khovanovDb;
     std::filesystem::path normalizerDir;
-    std::optional<std::filesystem::path> sqliteDb;
-    bool textDbsAvailable = false;
 };
 
 std::string readWholeFile(const std::filesystem::path& path) {
@@ -81,8 +77,7 @@ void usage(std::ostream& out) {
         << "  cpp_knot_indexer < code.txt\n\n"
         << "Options:\n"
         << "  --timeout SEC       Max seconds for HOMFLY-PT and Khovanov each (0 disables timeout; default 60).\n"
-        << "  --data-folder PATH  Folder containing knotname-reg/ and text or SQLite invariant data.\n"
-        << "  --sqlite-db PATH    Explicit SQLite invariant database. Overrides auto-detected SQLite files.\n"
+        << "  --data-folder PATH  Folder containing knotname-reg/, homfly/, and khovanov/ data.\n"
         << "  --ban-simplify      Do not simplify the input PD code before invariant lookup.\n"
         << "  --print-invariants  Print computed invariant strings to stderr.\n"
         << "  --verbose           Print worker status, failures, and invariant strings to stderr.\n";
@@ -132,25 +127,7 @@ std::filesystem::path absolutePath(const std::filesystem::path& path) {
     return ec ? path : absolute;
 }
 
-std::vector<std::filesystem::path> sqliteCandidates(const std::filesystem::path& folder) {
-    return {
-        folder / "knot-index.sqlite",
-        folder / "knot_index.sqlite",
-        folder / "invariants.sqlite",
-        folder / "name-pd" / "PD_m_3-16.sqlite",
-    };
-}
-
-std::optional<std::filesystem::path> findSqliteDatabase(const std::filesystem::path& folder) {
-    for (const std::filesystem::path& candidate : sqliteCandidates(folder)) {
-        if (existsPath(candidate)) return candidate;
-    }
-    return std::nullopt;
-}
-
-std::optional<DataPaths> tryResolveDataFolder(
-    const std::filesystem::path& folder,
-    const std::optional<std::filesystem::path>& explicitSqliteDb) {
+std::optional<DataPaths> tryResolveDataFolder(const std::filesystem::path& folder) {
     const std::filesystem::path homDir = folder / "homfly";
     const std::filesystem::path khoDir = folder / "khovanov";
     const std::filesystem::path normDir = folder / "knotname-reg";
@@ -160,44 +137,30 @@ std::optional<DataPaths> tryResolveDataFolder(
     paths.homflyDb = homDir / "sorted_HOMFLY-PT.txt";
     paths.khovanovDb = khoDir / "sorted_khovanov.txt";
     paths.normalizerDir = normDir;
-    paths.textDbsAvailable = existsPath(paths.homflyDb) && existsPath(paths.khovanovDb);
-    paths.sqliteDb = explicitSqliteDb.has_value() ? explicitSqliteDb : findSqliteDatabase(folder);
 
-    if (paths.textDbsAvailable || paths.sqliteDb.has_value()) return paths;
+    if (existsPath(paths.homflyDb) && existsPath(paths.khovanovDb)) return paths;
     return std::nullopt;
 }
 
 std::string dataFolderRequirement() {
-    return "data folder must contain knotname-reg/ and either "
-           "homfly/sorted_HOMFLY-PT.txt plus khovanov/sorted_khovanov.txt, "
-           "or a SQLite invariant database named knot-index.sqlite, knot_index.sqlite, "
-           "invariants.sqlite, or name-pd/PD_m_3-16.sqlite";
+    return "data folder must contain knotname-reg/, "
+           "homfly/sorted_HOMFLY-PT.txt, and khovanov/sorted_khovanov.txt";
 }
 
 DataPaths findDataPaths(const std::filesystem::path& executable,
-                        const std::filesystem::path& userFolder,
-                        const std::filesystem::path& userSqliteDb) {
-    std::optional<std::filesystem::path> explicitSqliteDb;
-    if (!userSqliteDb.empty()) {
-        explicitSqliteDb = absolutePath(userSqliteDb);
-        if (!existsPath(*explicitSqliteDb)) {
-            throw std::runtime_error("invalid --sqlite-db: " + cki::platform::displayPath(*explicitSqliteDb) +
-                                     "; file does not exist");
-        }
-    }
-
+                        const std::filesystem::path& userFolder) {
     if (!userFolder.empty()) {
         std::filesystem::path folder = absolutePath(userFolder);
-        if (auto paths = tryResolveDataFolder(folder, explicitSqliteDb)) return *paths;
+        if (auto paths = tryResolveDataFolder(folder)) return *paths;
         throw std::runtime_error("invalid --data-folder: " + cki::platform::displayPath(folder) + "; " + dataFolderRequirement());
     }
 
     std::filesystem::path exeDir = executable.parent_path();
     std::filesystem::path first = exeDir / "data";
-    if (auto paths = tryResolveDataFolder(first, explicitSqliteDb)) return *paths;
+    if (auto paths = tryResolveDataFolder(first)) return *paths;
 
     std::filesystem::path second = exeDir.parent_path() / "data";
-    if (auto paths = tryResolveDataFolder(second, explicitSqliteDb)) return *paths;
+    if (auto paths = tryResolveDataFolder(second)) return *paths;
 
     throw std::runtime_error("cannot locate default data folder at " + cki::platform::displayPath(first) +
                              " or " + cki::platform::displayPath(second) + "; pass --data-folder. " +
@@ -225,8 +188,6 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             if (options.timeoutSeconds < 0) throw std::runtime_error("--timeout must be >= 0");
         } else if (arg == "--data-folder") {
             options.dataFolder = needValue("--data-folder").path;
-        } else if (arg == "--sqlite-db") {
-            options.sqliteDb = needValue("--sqlite-db").path;
         } else if (arg == "--ban-simplify") {
             options.banSimplify = true;
         } else if (arg == "--print-invariants") {
@@ -606,7 +567,7 @@ int main(int argc, char** argv) {
         hki::PDCode pd = hki::parsePDCode(options.pdText);
         std::string canonicalPd = hki::formatPDCodeList(pd);
         std::filesystem::path executable = hki::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
-        hki::DataPaths dataPaths = hki::findDataPaths(executable, options.dataFolder, options.sqliteDb);
+        hki::DataPaths dataPaths = hki::findDataPaths(executable, options.dataFolder);
 
         hki::InvariantPipelineResult pipeline =
             hki::computeInvariantPipeline(executable, canonicalPd, options.timeoutSeconds, !options.banSimplify);
@@ -634,40 +595,21 @@ int main(int argc, char** argv) {
         }
 
         hki::NameNormalizer normalizer(dataPaths.normalizerDir);
-        std::optional<std::string> khovanovInvariant = khResult.success ? std::optional<std::string>(khResult.output) : std::nullopt;
-        std::optional<std::string> homflyInvariant = homResult.success ? std::optional<std::string>(homResult.output) : std::nullopt;
         std::vector<std::string> candidates;
 
-        if (dataPaths.sqliteDb.has_value()) {
-            hki::SqliteInvariantDatabase sqliteDb(*dataPaths.sqliteDb, normalizer);
-            if (options.verbose) {
-                std::cerr << "Invariant data source: " << sqliteDb.statusMessage() << "\n";
-            }
-            if (sqliteDb.hasInvariantRecords()) {
-                candidates = sqliteDb.lookup(homflyInvariant, khovanovInvariant);
-                if (options.verbose) {
-                    std::cerr << "SQLite candidate count: " << candidates.size() << "\n";
-                }
-            } else if (!dataPaths.textDbsAvailable) {
-                throw std::runtime_error("no usable invariant data source: " + sqliteDb.statusMessage());
-            }
+        if (options.verbose) {
+            std::cerr << "Invariant data source: text files "
+                      << cki::platform::displayPath(dataPaths.homflyDb) << " and "
+                      << cki::platform::displayPath(dataPaths.khovanovDb) << "\n";
         }
+        hki::InvariantMap khDb = hki::loadInvariantMap(dataPaths.khovanovDb, normalizer);
+        hki::InvariantMap homDb = hki::loadInvariantMap(dataPaths.homflyDb, normalizer);
 
-        if (candidates.empty() && dataPaths.textDbsAvailable) {
-            if (options.verbose) {
-                std::cerr << "Invariant data source: text files "
-                          << cki::platform::displayPath(dataPaths.homflyDb) << " and "
-                          << cki::platform::displayPath(dataPaths.khovanovDb) << "\n";
-            }
-            hki::InvariantMap khDb = hki::loadInvariantMap(dataPaths.khovanovDb, normalizer);
-            hki::InvariantMap homDb = hki::loadInvariantMap(dataPaths.homflyDb, normalizer);
-
-            std::vector<std::string> khNames = khResult.success ? hki::lookupInvariant(khDb, khResult.output) : std::vector<std::string>{};
-            std::vector<std::string> homNames = homResult.success ? hki::lookupInvariant(homDb, homResult.output) : std::vector<std::string>{};
-            candidates = hki::mergeCandidates(khResult, khNames, homResult, homNames);
-            if (options.verbose) {
-                std::cerr << "Text candidate count: " << candidates.size() << "\n";
-            }
+        std::vector<std::string> khNames = khResult.success ? hki::lookupInvariant(khDb, khResult.output) : std::vector<std::string>{};
+        std::vector<std::string> homNames = homResult.success ? hki::lookupInvariant(homDb, homResult.output) : std::vector<std::string>{};
+        candidates = hki::mergeCandidates(khResult, khNames, homResult, homNames);
+        if (options.verbose) {
+            std::cerr << "Text candidate count: " << candidates.size() << "\n";
         }
 
         for (const std::string& name : candidates) std::cout << name << "\n";

@@ -66,14 +66,6 @@ inline std::string displayPath(const std::filesystem::path& path) {
 #endif
 }
 
-inline std::string sqliteOpenPath(const std::filesystem::path& path) {
-#ifdef _WIN32
-    return displayPath(path);
-#else
-    return path.string();
-#endif
-}
-
 inline std::vector<ProgramArg> programArguments(int argc, char** argv) {
     std::vector<ProgramArg> args;
 #ifdef _WIN32

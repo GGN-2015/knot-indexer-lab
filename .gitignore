@@ -48,7 +48,6 @@ build-*/
 data/name-pd/PD_m_3-16.sorted.txt
 data/name-pd/PD_m_3-16.sqlite
 data/name-pd/PD_m_3-16.invariants.tsv
-third_party/cpp_knot_indexer/data/
 
 # CMake generated files
 CMakeFiles/

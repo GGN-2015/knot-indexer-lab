@@ -48,8 +48,7 @@ Local integration details:
   strings used by this project.
 
 The worker output is a normalized polynomial string. The main process uses that
-string to query either the SQLite `invariants` table or
-`data/homfly/sorted_HOMFLY-PT.txt`.
+string to query `data/homfly/sorted_HOMFLY-PT.txt`.
 
 The HOMFLY-PT worker receives a canonical PD string from the parent process,
 reparses it, applies the local PD simplification used by the HOMFLY adapter,
@@ -63,8 +62,7 @@ implementation under `third_party/cppkh`, which follows the JavaKh-style
 integer Khovanov computation path.
 
 The worker output is a normalized integral Khovanov string. The main process
-uses that string to query either the SQLite `invariants` table or
-`data/khovanov/sorted_khovanov.txt`.
+uses that string to query `data/khovanov/sorted_khovanov.txt`.
 
 The Khovanov worker also receives canonical PD text from the parent process.
 It calls the vendored `cppkh` backend through the local C ABI wrapper and
@@ -162,51 +160,24 @@ long-running simplification loops.
 
 ## Candidate Lookup
 
-The database layer maps invariant strings to candidate knot names. Name
-normalization uses `data/knotname-reg/` to account for mirrors and naming
-equivalences in the dataset.
-
-SQLite is preferred when a valid invariant database is configured. The
-supported table is:
-
-```sql
-CREATE TABLE invariants(
-  name TEXT,
-  canonical_pd TEXT,
-  homfly TEXT,
-  khovanov TEXT
-);
-```
-
-Only `name`, `homfly`, and `khovanov` are required for runtime lookup. The
-`canonical_pd` column is supported for compatibility with the
-`knot-indexer-lab` generated SQLite database.
-
-Auto-detected SQLite file names are:
-
-- `knot-index.sqlite`
-- `knot_index.sqlite`
-- `invariants.sqlite`
-- `name-pd/PD_m_3-16.sqlite`
+The database layer maps invariant strings to candidate knot names using the
+text files in `data/homfly/` and `data/khovanov/`. Name normalization uses
+`data/knotname-reg/` to account for mirrors and naming equivalences in the
+dataset.
 
 When both invariants succeed, the final result is the intersection of the
 HOMFLY-PT candidate set and the Khovanov candidate set. If only one invariant
-succeeds, the final result is the unique candidate set from that invariant. If
-a SQLite pair lookup has no hit, the lookup falls back to Khovanov-only and
-then HOMFLY-only queries before falling back to text invariant files.
+succeeds, the final result is the unique candidate set from that invariant.
 
 The lookup order is:
 
-1. Query SQLite by `(homfly, khovanov)` when both values are available.
-2. Query SQLite by `khovanov` when Khovanov is available.
-3. Query SQLite by `homfly` when HOMFLY-PT is available.
-4. If SQLite has no candidate and text databases are available, query the text
-   Khovanov and HOMFLY-PT maps.
-5. For text data, intersect the two candidate sets when both invariants are
-   available; otherwise use the single successful invariant set.
+1. Query the Khovanov text map when Khovanov is available.
+2. Query the HOMFLY-PT text map when HOMFLY-PT is available.
+3. Intersect the two candidate sets when both invariants are available;
+   otherwise use the single successful invariant set.
 
-Names from both data sources pass through `NameNormalizer`, which applies the
-`knotname-reg` mirror and name-pair data before final sorting and de-duplication.
+Names pass through `NameNormalizer`, which applies the `knotname-reg` mirror
+and name-pair data before final sorting and de-duplication.
 
 ## Molecule Data to Coordinates
 

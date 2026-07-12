@@ -39,41 +39,27 @@ The task monitor is available from the main page and directly at:
 http://127.0.0.1:5000/tasks.html
 ```
 
-For full name lookup, place the PD database here before building or running:
+Runtime lookup data uses the upstream `cpp_knot_indexer` text layout:
 
 ```text
-data/name-pd/PD_m_3-16.sorted.txt
+data/homfly/sorted_HOMFLY-PT.txt
+data/khovanov/sorted_khovanov.txt
+data/knotname-reg/
 ```
 
-Then import it into SQLite:
-
-```sh
-build/knot_indexer_lab_server --build-sqlite
-```
-
-Build the invariant index for candidate lookup:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index
-```
-
-By default this indexes knots with total crossing number <= 14, including
-composite knots whose factor crossing numbers sum to <= 14. Use
-`--max-crossing N` to choose a positive limit up to 16.
-
-For a small smoke test:
-
-```sh
-build/knot_indexer_lab_server --build-pd-index --index-limit 100
-```
+`build.py` copies this `data/` folder beside the executable. SQLite and PD_m
+index build modes are not supported in this version. Name-to-PD lookup is
+unavailable until a compatible upstream text data source exists again; PD and
+3D-coordinate lookup continue to retrieve candidate names from HOMFLY-PT and
+Khovanov text tables.
 
 On Windows, replace `build/knot_indexer_lab_server` with
 `.\build\knot_indexer_lab_server.exe`.
 
 ## Manuals
 
-- [CLI Manual](docs/cli.md): build script options, server options, and indexing commands.
-- [Runtime Data Manual](docs/runtime-data.md): PD_m data layout, SQLite import, and invariant database generation.
+- [CLI Manual](docs/cli.md): build script and server options.
+- [Runtime Data Manual](docs/runtime-data.md): upstream text data layout.
 - [Algorithm Manual](docs/algorithm.md): lookup pipeline, timeout model, name canonicalization, task recovery, and third-party code.
 - [API Manual](docs/api.md): HTTP endpoints, WebSocket updates, and response shapes.
 
@@ -87,6 +73,6 @@ If you use this project in academic work, please cite it as:
   author       = {GGN-2015},
   year         = {2026},
   url          = {https://github.com/GGN-2015/knot-indexer},
-  note         = {Pure C++ implementation with PD_m retrieval data, SQLite indexing, HOMFLY-PT polynomial computation, and Khovanov homology computation}
+  note         = {Pure C++ implementation with upstream text invariant data, HOMFLY-PT polynomial computation, and Khovanov homology computation}
 }
 ```

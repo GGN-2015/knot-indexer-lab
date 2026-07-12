@@ -1,4 +1,4 @@
-#ifdef _WIN32
+﻿#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -10,6 +10,7 @@
 #include <windows.h>
 #endif
 
+#include "database.hpp"
 #include "homfly_backend.hpp"
 #include "khovanov_backend.hpp"
 #include "link_pd_code.hpp"
@@ -18,7 +19,6 @@
 #include "path_utils.hpp"
 #include "process_runner.hpp"
 #include "runtime_control.hpp"
-#include "sqlite3.h"
 
 #ifndef DEBUG
 #define DEBUG 0
@@ -51,11 +51,9 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <ctime>
-#include <deque>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -74,7 +72,6 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -116,12 +113,6 @@ struct Options {
     std::string host = "0.0.0.0";
     int port = kDefaultPort;
     int timeoutSeconds = kMaxComputeTimeoutSeconds;
-    bool buildSqlite = false;
-    bool buildPdIndex = false;
-    std::size_t indexLimit = 0;
-    std::size_t indexWorkers = 0;
-    std::size_t indexBatchSize = 256;
-    int indexProgressSeconds = 5;
     int maxCrossing = kDefaultMaxCrossing;
     std::filesystem::path dataFolder;
     std::filesystem::path webRoot;
@@ -129,9 +120,8 @@ struct Options {
 
 struct DataPaths {
     std::filesystem::path root;
-    std::filesystem::path namePdFile;
-    std::filesystem::path sqliteFile;
-    std::filesystem::path invariantIndexFile;
+    std::filesystem::path homflyDb;
+    std::filesystem::path khovanovDb;
     std::filesystem::path knotNameRegDir;
 };
 
@@ -174,83 +164,6 @@ struct LookupResult {
     hki::WorkerResult homflyWorker;
     hki::WorkerResult khovanovWorker;
 };
-
-template <typename T>
-class BlockingQueue {
-public:
-    explicit BlockingQueue(std::size_t capacity) : capacity_(std::max<std::size_t>(1, capacity)) {}
-
-    bool push(T item, const std::atomic_bool& stopRequested) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] {
-            return closed_ || stopRequested.load() || items_.size() < capacity_;
-        });
-        if (closed_ || stopRequested.load()) return false;
-        items_.push_back(std::move(item));
-        cv_.notify_all();
-        return true;
-    }
-
-    bool pop(T& item, const std::atomic_bool& stopRequested) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] {
-            return closed_ || stopRequested.load() || !items_.empty();
-        });
-        if (items_.empty()) return false;
-        item = std::move(items_.front());
-        items_.pop_front();
-        cv_.notify_all();
-        return true;
-    }
-
-    void close() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            closed_ = true;
-        }
-        cv_.notify_all();
-    }
-
-private:
-    std::size_t capacity_;
-    std::deque<T> items_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    bool closed_ = false;
-};
-
-struct IndexBuildStats {
-    std::atomic<std::size_t> queued{0};
-    std::atomic<std::size_t> processed{0};
-    std::atomic<std::size_t> succeeded{0};
-    std::atomic<std::size_t> written{0};
-    std::atomic<std::size_t> skipped{0};
-    std::atomic<std::size_t> failed{0};
-};
-
-struct IndexBuildResult {
-    std::size_t written = 0;
-    std::size_t skipped = 0;
-    std::size_t failed = 0;
-    std::size_t totalTarget = 0;
-};
-
-std::string formatDurationHms(std::uint64_t totalSeconds) {
-    const std::uint64_t hours = totalSeconds / 3600;
-    const std::uint64_t minutes = (totalSeconds / 60) % 60;
-    const std::uint64_t seconds = totalSeconds % 60;
-    std::ostringstream out;
-    out << std::setfill('0') << std::setw(2) << hours
-        << ":" << std::setw(2) << minutes
-        << ":" << std::setw(2) << seconds;
-    return out.str();
-}
-
-std::string formatRate(double value) {
-    std::ostringstream out;
-    out << std::fixed << std::setprecision(value >= 100.0 ? 1 : 2) << value;
-    return out.str();
-}
 
 bool startsWith(const std::string& value, const std::string& prefix) {
     return value.size() >= prefix.size() &&
@@ -321,10 +234,6 @@ std::filesystem::path absolutePath(const std::filesystem::path& path) {
     return ec ? path : out;
 }
 
-std::string pathUtf8(const std::filesystem::path& path) {
-    return cki::platform::sqliteOpenPath(path);
-}
-
 std::filesystem::path currentExecutablePath(const std::filesystem::path& argv0) {
 #ifdef _WIN32
     std::wstring buffer(32768, L'\0');
@@ -355,13 +264,13 @@ std::filesystem::path currentExecutablePath(const std::filesystem::path& argv0) 
 
 std::optional<DataPaths> tryResolveDataFolder(const std::filesystem::path& folder) {
     if (!isDirectory(folder)) return std::nullopt;
-    const std::filesystem::path nested = folder / "name-pd" / "PD_m_3-16.sorted.txt";
-    const std::filesystem::path flat = folder / "PD_m_3-16.sorted.txt";
-    const bool hasNestedFolder = isDirectory(folder / "name-pd");
-    const std::filesystem::path namePdFile = (existsPath(nested) || (!existsPath(flat) && hasNestedFolder)) ? nested : flat;
-    const std::filesystem::path sqliteFile = namePdFile.parent_path() / "PD_m_3-16.sqlite";
-    const std::filesystem::path indexFile = namePdFile.parent_path() / "PD_m_3-16.invariants.tsv";
-    return DataPaths{folder, namePdFile, sqliteFile, indexFile, folder / "knotname-reg"};
+    const std::filesystem::path homflyDb = folder / "homfly" / "sorted_HOMFLY-PT.txt";
+    const std::filesystem::path khovanovDb = folder / "khovanov" / "sorted_khovanov.txt";
+    const std::filesystem::path knotNameRegDir = folder / "knotname-reg";
+    if (!existsPath(homflyDb) || !existsPath(khovanovDb) || !isDirectory(knotNameRegDir)) {
+        return std::nullopt;
+    }
+    return DataPaths{folder, homflyDb, khovanovDb, knotNameRegDir};
 }
 
 DataPaths resolveDataFolder(const std::filesystem::path& executable, const std::filesystem::path& userFolder) {
@@ -375,7 +284,9 @@ DataPaths resolveDataFolder(const std::filesystem::path& executable, const std::
     for (const std::filesystem::path& candidate : candidates) {
         if (auto paths = tryResolveDataFolder(absolutePath(candidate))) return *paths;
     }
-    throw std::runtime_error("cannot locate data folder; pass --data-folder");
+    throw std::runtime_error(
+        "cannot locate data folder; pass --data-folder. The folder must contain "
+        "homfly/sorted_HOMFLY-PT.txt, khovanov/sorted_khovanov.txt, and knotname-reg/.");
 }
 
 std::filesystem::path resolveWebRoot(const std::filesystem::path& executable, const std::filesystem::path& userRoot) {
@@ -780,6 +691,20 @@ std::string workerStatusText(const hki::WorkerResult& result) {
     return "pending";
 }
 
+class CancellationToken {
+public:
+    void cancel() {
+        cancelled_.store(true);
+    }
+
+    bool cancelled() const {
+        return cancelled_.load();
+    }
+
+private:
+    std::atomic_bool cancelled_{false};
+};
+
 struct TaskRecord {
     std::uint64_t id = 0;
     std::string clientId;
@@ -800,7 +725,7 @@ struct TaskRecord {
     std::string startedAt;
     std::string endedAt;
     bool cancelRequested = false;
-    std::shared_ptr<hki::CancellationToken> cancellation;
+    std::shared_ptr<CancellationToken> cancellation;
 };
 
 class TaskManager {
@@ -814,7 +739,7 @@ public:
         task->inputType = std::move(inputType);
         task->input = std::move(input);
         task->startedAt = localTimestamp();
-        task->cancellation = std::make_shared<hki::CancellationToken>();
+        task->cancellation = std::make_shared<CancellationToken>();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             tasks_.push_back(task);
@@ -1033,170 +958,6 @@ std::optional<int> totalKnotCrossings(const std::string& rawName) {
     }
     if (!hasFactor) return std::nullopt;
     return total;
-}
-
-class NameCanonicalizer {
-public:
-    explicit NameCanonicalizer(const std::filesystem::path& knotNameRegDir) {
-        loadNamePairs(knotNameRegDir / "name_pair.txt");
-        loadAmphichiral(knotNameRegDir / "amphichiral_list.txt");
-    }
-
-    std::string normalize(const std::string& rawName) const {
-        std::vector<std::string> parts;
-        std::size_t start = 0;
-        while (start <= rawName.size()) {
-            const std::size_t pos = rawName.find(',', start);
-            parts.push_back(normalizePrime(rawName.substr(start, pos == std::string::npos ? std::string::npos : pos - start)));
-            if (pos == std::string::npos) break;
-            start = pos + 1;
-        }
-
-        parts.erase(std::remove_if(parts.begin(), parts.end(), [](const std::string& value) {
-            return value.empty();
-        }), parts.end());
-        if (parts.empty()) return "";
-        std::sort(parts.begin(), parts.end());
-        return join(parts, ",");
-    }
-
-    std::string statusMessage() const {
-        std::ostringstream out;
-        out << "name canonicalizer: " << legacyToModern_.size() << " legacy aliases, "
-            << amphichiralModern_.size() << " amphichiral prime knots";
-        return out.str();
-    }
-
-private:
-    std::unordered_map<std::string, std::string> legacyToModern_;
-    std::unordered_map<std::string, std::string> modernToLegacy_;
-    std::unordered_set<std::string> amphichiralLegacy_;
-    std::unordered_set<std::string> amphichiralModern_;
-
-    std::string normalizePrime(const std::string& rawName) const {
-        std::string name = normalizeNameSyntax(rawName);
-        if (name.empty()) return "";
-
-        bool mirror = false;
-        if (name.size() > 1 && name[0] == 'm') {
-            mirror = true;
-            name = name.substr(1);
-        }
-
-        const std::string base = modernize(name);
-        if (isAmphichiral(base)) return base;
-        return mirror ? ("m" + base) : base;
-    }
-
-    std::string modernize(const std::string& rawBase) const {
-        const std::string base = normalizeNameSyntax(rawBase);
-        const auto legacy = legacyToModern_.find(base);
-        if (legacy != legacyToModern_.end()) return legacy->second;
-        return base;
-    }
-
-    bool isAmphichiral(const std::string& rawBase) const {
-        const std::string base = normalizeNameSyntax(rawBase);
-        if (amphichiralModern_.find(base) != amphichiralModern_.end()) return true;
-        if (amphichiralLegacy_.find(base) != amphichiralLegacy_.end()) return true;
-
-        const auto legacy = modernToLegacy_.find(base);
-        if (legacy != modernToLegacy_.end() &&
-            amphichiralLegacy_.find(legacy->second) != amphichiralLegacy_.end()) {
-            return true;
-        }
-
-        const auto modern = legacyToModern_.find(base);
-        return modern != legacyToModern_.end() &&
-               amphichiralModern_.find(modern->second) != amphichiralModern_.end();
-    }
-
-    void loadNamePairs(const std::filesystem::path& file) {
-        std::ifstream input(file);
-        if (!input) return;
-
-        std::string line;
-        while (std::getline(input, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == '#') continue;
-            std::istringstream row(line);
-            std::string legacyRaw;
-            std::string modernRaw;
-            row >> legacyRaw >> modernRaw;
-            const std::string legacy = normalizeNameSyntax(legacyRaw);
-            const std::string modern = normalizeNameSyntax(modernRaw);
-            if (legacy.empty() || modern.empty()) continue;
-            legacyToModern_[legacy] = modern;
-            modernToLegacy_[modern] = legacy;
-        }
-    }
-
-    void loadAmphichiral(const std::filesystem::path& file) {
-        std::ifstream input(file);
-        if (!input) return;
-
-        std::string line;
-        while (std::getline(input, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == '#') continue;
-            const std::string legacy = normalizeNameSyntax(line);
-            if (legacy.empty()) continue;
-            amphichiralLegacy_.insert(legacy);
-            amphichiralModern_.insert(modernize(legacy));
-        }
-    }
-};
-
-std::string cleanFieldForTsv(std::string value) {
-    for (char& c : value) {
-        if (c == '\t' || c == '\r' || c == '\n') c = ' ';
-    }
-    return trim(value);
-}
-
-std::vector<std::string> splitTabLine(const std::string& line) {
-    std::vector<std::string> parts;
-    std::size_t start = 0;
-    while (start <= line.size()) {
-        const std::size_t pos = line.find('\t', start);
-        parts.push_back(line.substr(start, pos == std::string::npos ? std::string::npos : pos - start));
-        if (pos == std::string::npos) break;
-        start = pos + 1;
-    }
-    return parts;
-}
-
-bool parseNamePdRecord(const std::string& rawLine, std::string& name, std::string& pd) {
-    std::size_t start = 0;
-    std::size_t end = rawLine.size();
-    while (start < end && std::isspace(static_cast<unsigned char>(rawLine[start]))) ++start;
-    while (end > start && std::isspace(static_cast<unsigned char>(rawLine[end - 1]))) --end;
-    if (start >= end || rawLine[start] == '#') return false;
-    if (rawLine[start] == '[' && rawLine[end - 1] == ']') {
-        ++start;
-        --end;
-    }
-    const std::size_t sep = rawLine.find('|', start);
-    if (sep == std::string::npos || sep >= end) return false;
-    name = trim(rawLine.substr(start, sep - start));
-    pd = trim(rawLine.substr(sep + 1, end - sep - 1));
-    return !name.empty() && !pd.empty();
-}
-
-bool parseNamePdName(const std::string& rawLine, std::string& name) {
-    std::size_t start = 0;
-    std::size_t end = rawLine.size();
-    while (start < end && std::isspace(static_cast<unsigned char>(rawLine[start]))) ++start;
-    while (end > start && std::isspace(static_cast<unsigned char>(rawLine[end - 1]))) --end;
-    if (start >= end || rawLine[start] == '#') return false;
-    if (rawLine[start] == '[' && rawLine[end - 1] == ']') {
-        ++start;
-        --end;
-    }
-    const std::size_t sep = rawLine.find('|', start);
-    if (sep == std::string::npos || sep >= end) return false;
-    name = trim(rawLine.substr(start, sep - start));
-    return !name.empty();
 }
 
 std::optional<std::string> canonicalizePdText(const std::string& pdText) {
@@ -1645,822 +1406,22 @@ PdDiagram buildPdDiagram(const std::string& pdText) {
     }
 }
 
-std::string sqliteError(sqlite3* db) {
-    return db ? sqlite3_errmsg(db) : "sqlite handle is null";
-}
-
-bool isCorruptSqliteMessage(const std::string& message) {
-    const std::string lower = lowerCopy(message);
-    return lower.find("database disk image is malformed") != std::string::npos ||
-           lower.find("file is not a database") != std::string::npos ||
-           lower.find("malformed") != std::string::npos;
-}
-
-class SqliteStatement {
-public:
-    SqliteStatement(sqlite3* db, const std::string& sql) : db_(db) {
-        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt_, nullptr) != SQLITE_OK) {
-            throw std::runtime_error("sqlite prepare failed: " + sqliteError(db_));
-        }
-    }
-
-    ~SqliteStatement() {
-        if (stmt_) sqlite3_finalize(stmt_);
-    }
-
-    SqliteStatement(const SqliteStatement&) = delete;
-    SqliteStatement& operator=(const SqliteStatement&) = delete;
-
-    void bindText(int index, const std::string& value) {
-        if (sqlite3_bind_text(stmt_, index, value.c_str(), -1, SQLITE_TRANSIENT) != SQLITE_OK) {
-            throw std::runtime_error("sqlite bind failed: " + sqliteError(db_));
-        }
-    }
-
-    void bindInt64(int index, sqlite3_int64 value) {
-        if (sqlite3_bind_int64(stmt_, index, value) != SQLITE_OK) {
-            throw std::runtime_error("sqlite bind failed: " + sqliteError(db_));
-        }
-    }
-
-    int step() {
-        const int rc = sqlite3_step(stmt_);
-        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-            throw std::runtime_error("sqlite step failed: " + sqliteError(db_));
-        }
-        return rc;
-    }
-
-    void stepDone() {
-        const int rc = step();
-        if (rc != SQLITE_DONE) throw std::runtime_error("sqlite statement returned an unexpected row");
-    }
-
-    std::string columnText(int index) const {
-        const unsigned char* value = sqlite3_column_text(stmt_, index);
-        return value ? reinterpret_cast<const char*>(value) : "";
-    }
-
-    std::size_t columnSize(int index) const {
-        return static_cast<std::size_t>(sqlite3_column_int64(stmt_, index));
-    }
-
-    void reset() {
-        sqlite3_reset(stmt_);
-        sqlite3_clear_bindings(stmt_);
-    }
-
-private:
-    sqlite3* db_ = nullptr;
-    sqlite3_stmt* stmt_ = nullptr;
-};
-
-class PdSqliteStore {
-public:
-    struct Record {
-        std::string name;
-        std::string pd;
-    };
-
-    struct InvariantRecord {
-        std::string name;
-        std::string canonicalPd;
-        std::string homfly;
-        std::string khovanov;
-    };
-
-    PdSqliteStore(std::filesystem::path file, const NameCanonicalizer& names)
-        : file_(std::move(file)), names_(names) {
-        if (existsPath(file_)) {
-            try {
-                openReadOnly();
-                refreshCounts();
-            } catch (const std::exception& error) {
-                statusMessage_ = "SQLite database could not be opened at " + cki::platform::displayPath(file_) + ": " + error.what();
-                close();
-            }
-        }
-    }
-
-    ~PdSqliteStore() {
-        close();
-    }
-
-    PdSqliteStore(const PdSqliteStore&) = delete;
-    PdSqliteStore& operator=(const PdSqliteStore&) = delete;
-
-    bool hasPdRecords() const {
-        return db_ && pdRecordCount_ > 0;
-    }
-
-    bool hasInvariantRecords() const {
-        return db_ && invariantRecordCount_ > 0;
-    }
-
-    std::string statusMessage() const {
-        if (!db_) {
-            if (!statusMessage_.empty()) return statusMessage_;
-            return "SQLite database not found at " + cki::platform::displayPath(file_) + ".";
-        }
-        return "SQLite database: " + std::to_string(pdRecordCount_) + " PD records and " +
-               std::to_string(invariantRecordCount_) + " invariant records from " + cki::platform::displayPath(file_);
-    }
-
-    std::optional<std::string> lookupPd(const std::string& rawName) const {
-        if (!hasPdRecords()) return std::nullopt;
-        const std::string name = names_.normalize(rawName);
-        if (name.empty()) return std::nullopt;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        SqliteStatement stmt(db_, "SELECT pd FROM pd_records WHERE name = ?");
-        stmt.bindText(1, name);
-        if (stmt.step() != SQLITE_ROW) return std::nullopt;
-        return stmt.columnText(0);
-    }
-
-    std::vector<std::string> lookupInvariants(const std::optional<std::string>& homfly,
-                                              const std::optional<std::string>& khovanov) const {
-        if (!hasInvariantRecords()) return {};
-        if (homfly.has_value() && khovanov.has_value()) {
-            std::vector<std::string> names = queryNames(
-                "SELECT name FROM invariants WHERE homfly = ? AND khovanov = ? ORDER BY name",
-                {*homfly, *khovanov});
-            if (!names.empty()) return names;
-        }
-        if (khovanov.has_value()) {
-            std::vector<std::string> names = queryNames(
-                "SELECT name FROM invariants WHERE khovanov = ? ORDER BY name",
-                {*khovanov});
-            if (!names.empty()) return names;
-        }
-        if (homfly.has_value()) {
-            return queryNames("SELECT name FROM invariants WHERE homfly = ? ORDER BY name", {*homfly});
-        }
-        return {};
-    }
-
-    std::vector<std::string> lookupByCanonicalPd(const std::string& canonicalPd) const {
-        if (!hasPdRecords() || canonicalPd.empty()) return {};
-        return queryNames("SELECT name FROM pd_records WHERE pd = ? ORDER BY name", {canonicalPd});
-    }
-
-    bool hasInvariantName(const std::string& rawName) const {
-        if (!hasInvariantRecords()) return false;
-        const std::string name = names_.normalize(rawName);
-        if (name.empty()) return false;
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        SqliteStatement stmt(db_, "SELECT 1 FROM invariants WHERE name = ? LIMIT 1");
-        stmt.bindText(1, name);
-        return stmt.step() == SQLITE_ROW;
-    }
-
-    void appendInvariant(const std::string& rawName,
-                         const std::string& canonicalPd,
-                         const std::string& homfly,
-                         const std::string& khovanov) {
-        appendInvariantBatch({InvariantRecord{rawName, canonicalPd, homfly, khovanov}});
-    }
-
-    std::size_t appendInvariantBatch(const std::vector<InvariantRecord>& records) {
-        if (records.empty()) return 0;
-        std::lock_guard<std::mutex> lock(mutex_);
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-
-        std::size_t written = 0;
-        execNoLock("BEGIN IMMEDIATE");
-        try {
-            SqliteStatement stmt(
-                db_,
-                "INSERT OR REPLACE INTO invariants(name, canonical_pd, homfly, khovanov) VALUES (?, ?, ?, ?)");
-            for (const InvariantRecord& record : records) {
-                const std::string name = names_.normalize(record.name);
-                if (name.empty() || record.canonicalPd.empty() || record.homfly.empty() || record.khovanov.empty()) continue;
-                stmt.bindText(1, name);
-                stmt.bindText(2, record.canonicalPd);
-                stmt.bindText(3, record.homfly);
-                stmt.bindText(4, record.khovanov);
-                stmt.stepDone();
-                written += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
-                stmt.reset();
-            }
-            execNoLock("COMMIT");
-        } catch (...) {
-            try {
-                execNoLock("ROLLBACK");
-            } catch (const std::exception&) {
-            }
-            throw;
-        }
-        invariantRecordCount_ += written;
-        return written;
-    }
-
-    std::size_t importNamePdText(const std::filesystem::path& textFile, std::size_t limit) {
-        try {
-            return importNamePdTextOnce(textFile, limit);
-        } catch (const std::exception& error) {
-            if (!isCorruptSqliteMessage(error.what())) throw;
-            std::cerr << "warning: SQLite database at " << file_
-                      << " is malformed; deleting it and rebuilding from PD_m text data.\n";
-            removeDatabaseFilesForRebuild();
-            return importNamePdTextOnce(textFile, limit);
-        }
-    }
-
-    void beginInvariantBulkBuild() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        openWritableIfNeeded();
-        execNoLock("PRAGMA journal_mode=WAL");
-        execNoLock("PRAGMA synchronous=NORMAL");
-        execNoLock("PRAGMA temp_store=MEMORY");
-        execNoLock("PRAGMA cache_size=-262144");
-        ensureSchemaNoLock();
-        execNoLock("DROP INDEX IF EXISTS idx_invariants_homfly");
-        execNoLock("DROP INDEX IF EXISTS idx_invariants_khovanov");
-        execNoLock("DROP INDEX IF EXISTS idx_invariants_pair");
-        refreshCountsNoLock();
-    }
-
-    void finishInvariantBulkBuild() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-        ensureIndexesNoLock();
-        execNoLock("PRAGMA optimize");
-        refreshCountsNoLock();
-    }
-
-    std::size_t countUnindexedRecords() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return 0;
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-        SqliteStatement stmt(
-            db_,
-            "SELECT COUNT(*) "
-            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
-            "WHERE i.name IS NULL");
-        if (stmt.step() != SQLITE_ROW) return 0;
-        return stmt.columnSize(0);
-    }
-
-    std::vector<Record> fetchUnindexedRecordsAfter(const std::string& lastName, std::size_t limit) {
-        if (limit == 0) return {};
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return {};
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-
-        SqliteStatement stmt(
-            db_,
-            "SELECT p.name, p.pd "
-            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
-            "WHERE i.name IS NULL AND (?1 = '' OR p.name > ?1) "
-            "ORDER BY p.name LIMIT ?2");
-        stmt.bindText(1, lastName);
-        stmt.bindInt64(2, static_cast<sqlite3_int64>(limit));
-
-        std::vector<Record> records;
-        records.reserve(limit);
-        while (stmt.step() == SQLITE_ROW) {
-            records.push_back(Record{stmt.columnText(0), stmt.columnText(1)});
-        }
-        return records;
-    }
-
-    std::vector<std::string> fetchUnindexedNamesAfter(const std::string& lastName, std::size_t limit) {
-        if (limit == 0) return {};
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return {};
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-
-        SqliteStatement stmt(
-            db_,
-            "SELECT p.name "
-            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
-            "WHERE i.name IS NULL AND (?1 = '' OR p.name > ?1) "
-            "ORDER BY p.name LIMIT ?2");
-        stmt.bindText(1, lastName);
-        stmt.bindInt64(2, static_cast<sqlite3_int64>(limit));
-
-        std::vector<std::string> names;
-        names.reserve(limit);
-        while (stmt.step() == SQLITE_ROW) {
-            names.push_back(stmt.columnText(0));
-        }
-        return names;
-    }
-
-    std::vector<Record> fetchRecordsByNames(const std::vector<std::string>& names) {
-        if (names.empty()) return {};
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!db_) return {};
-        openWritableIfNeeded();
-        ensureSchemaNoLock();
-
-        SqliteStatement stmt(db_, "SELECT pd FROM pd_records WHERE name = ?1");
-        std::vector<Record> records;
-        records.reserve(names.size());
-        for (const std::string& name : names) {
-            stmt.bindText(1, name);
-            if (stmt.step() == SQLITE_ROW) {
-                records.push_back(Record{name, stmt.columnText(0)});
-            }
-            stmt.reset();
-        }
-        return records;
-    }
-
-    template <typename Callback>
-    void forEachUnindexedRecord(Callback callback) {
-        if (!hasPdRecords()) return;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            openWritableIfNeeded();
-            ensureSchemaNoLock();
-        }
-        std::string name;
-        std::string pd;
-        SqliteStatement stmt(
-            db_,
-            "SELECT p.name, p.pd "
-            "FROM pd_records p LEFT JOIN invariants i ON i.name = p.name "
-            "WHERE i.name IS NULL ORDER BY p.name");
-
-        while (!hki::interrupted()) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                const int rc = stmt.step();
-                if (rc == SQLITE_DONE) break;
-                name = stmt.columnText(0);
-                pd = stmt.columnText(1);
-            }
-            if (!callback(Record{name, pd})) break;
-        }
-    }
-
-private:
-    std::filesystem::path file_;
-    const NameCanonicalizer& names_;
-    mutable std::mutex mutex_;
-    sqlite3* db_ = nullptr;
-    bool writable_ = false;
-    std::size_t pdRecordCount_ = 0;
-    std::size_t invariantRecordCount_ = 0;
-    std::string statusMessage_;
-
-    std::size_t importNamePdTextOnce(const std::filesystem::path& textFile, std::size_t limit) {
-        if (!existsPath(textFile)) {
-            throw std::runtime_error("PD_m text database not found at " + cki::platform::displayPath(textFile) + ".");
-        }
-        std::ifstream input(textFile, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot open PD_m text database at " + cki::platform::displayPath(textFile) + ".");
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        openWritableIfNeeded();
-        configureBulkImportNoLock();
-        ensureSchemaNoLock();
-        execNoLock("BEGIN IMMEDIATE");
-
-        std::size_t imported = 0;
-        std::size_t seen = 0;
-        try {
-            SqliteStatement stmt(db_, "INSERT OR IGNORE INTO pd_records(name, pd) VALUES (?, ?)");
-            std::string line;
-            while (std::getline(input, line)) {
-                if (limit > 0 && imported >= limit) break;
-                std::string name;
-                std::string pd;
-                if (!parseNamePdRecord(line, name, pd)) continue;
-                name = names_.normalize(name);
-                if (name.empty()) continue;
-
-                stmt.bindText(1, name);
-                stmt.bindText(2, pd);
-                stmt.stepDone();
-                imported += static_cast<std::size_t>(sqlite3_changes(db_) > 0 ? 1 : 0);
-                stmt.reset();
-                ++seen;
-
-                if (seen % 50000 == 0) {
-                    execNoLock("COMMIT");
-                    std::cerr << "SQLite import progress: read " << seen << " rows, inserted "
-                              << imported << " canonical rows.\n";
-                    execNoLock("BEGIN IMMEDIATE");
-                }
-            }
-        execNoLock("COMMIT");
-        } catch (...) {
-            try {
-                execNoLock("ROLLBACK");
-            } catch (const std::exception&) {
-            }
-            throw;
-        }
-
-        ensureIndexesNoLock();
-        refreshCountsNoLock();
-        std::cerr << "SQLite PD_m import complete: inserted " << imported
-                  << " canonical rows into " << file_ << ".\n";
-        return imported;
-    }
-
-    void removeDatabaseFilesForRebuild() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        close();
-
-        std::vector<std::filesystem::path> files;
-        files.push_back(file_);
-        std::filesystem::path wal = file_;
-        wal += "-wal";
-        files.push_back(wal);
-        std::filesystem::path shm = file_;
-        shm += "-shm";
-        files.push_back(shm);
-        std::filesystem::path journal = file_;
-        journal += "-journal";
-        files.push_back(journal);
-
-        for (const std::filesystem::path& path : files) {
-            std::error_code ec;
-            if (!std::filesystem::exists(path, ec)) continue;
-            ec.clear();
-            std::filesystem::remove(path, ec);
-            if (ec) {
-                throw std::runtime_error("cannot delete malformed SQLite file " +
-                                         cki::platform::displayPath(path) + ": " + ec.message());
-            }
-        }
-
-        statusMessage_.clear();
-    }
-
-    void close() {
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-        writable_ = false;
-        pdRecordCount_ = 0;
-        invariantRecordCount_ = 0;
-    }
-
-    void openReadOnly() {
-        open(SQLITE_OPEN_READONLY, false);
-    }
-
-    void openWritableIfNeeded() {
-        if (db_ && writable_) return;
-        if (db_) close();
-        std::filesystem::create_directories(file_.parent_path());
-        open(SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, true);
-    }
-
-    void open(int flags, bool writable) {
-        sqlite3* db = nullptr;
-        const std::string filename = pathUtf8(file_);
-        const int rc = sqlite3_open_v2(filename.c_str(), &db, flags, nullptr);
-        if (rc != SQLITE_OK) {
-            std::string message = db ? sqlite3_errmsg(db) : "unknown sqlite open error";
-            if (db) sqlite3_close(db);
-            throw std::runtime_error(message);
-        }
-        db_ = db;
-        writable_ = writable;
-        sqlite3_busy_timeout(db_, 30000);
-    }
-
-    void execNoLock(const std::string& sql) {
-        char* error = nullptr;
-        const int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &error);
-        if (rc != SQLITE_OK) {
-            std::string message = error ? error : sqliteError(db_);
-            sqlite3_free(error);
-            throw std::runtime_error("sqlite exec failed: " + message);
-        }
-    }
-
-    void configureBulkImportNoLock() {
-        execNoLock("PRAGMA journal_mode=OFF");
-        execNoLock("PRAGMA synchronous=OFF");
-        execNoLock("PRAGMA temp_store=MEMORY");
-        execNoLock("PRAGMA locking_mode=EXCLUSIVE");
-    }
-
-    void ensureSchemaNoLock() {
-        execNoLock(
-            "CREATE TABLE IF NOT EXISTS pd_records("
-            "name TEXT PRIMARY KEY,"
-            "pd TEXT NOT NULL)");
-        execNoLock(
-            "CREATE TABLE IF NOT EXISTS invariants("
-            "name TEXT PRIMARY KEY,"
-            "canonical_pd TEXT NOT NULL,"
-            "homfly TEXT NOT NULL,"
-            "khovanov TEXT NOT NULL)");
-    }
-
-    void ensureIndexesNoLock() {
-        execNoLock("CREATE INDEX IF NOT EXISTS idx_pd_records_pd ON pd_records(pd)");
-        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_homfly ON invariants(homfly)");
-        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_khovanov ON invariants(khovanov)");
-        execNoLock("CREATE INDEX IF NOT EXISTS idx_invariants_pair ON invariants(homfly, khovanov)");
-    }
-
-    bool tableExistsNoLock(const std::string& table) const {
-        SqliteStatement stmt(db_, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1");
-        stmt.bindText(1, table);
-        return stmt.step() == SQLITE_ROW;
-    }
-
-    std::size_t countRowsNoLock(const std::string& table) const {
-        SqliteStatement stmt(db_, "SELECT COUNT(*) FROM " + table);
-        if (stmt.step() != SQLITE_ROW) return 0;
-        return stmt.columnSize(0);
-    }
-
-    void refreshCounts() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        refreshCountsNoLock();
-    }
-
-    void refreshCountsNoLock() {
-        pdRecordCount_ = tableExistsNoLock("pd_records") ? countRowsNoLock("pd_records") : 0;
-        invariantRecordCount_ = tableExistsNoLock("invariants") ? countRowsNoLock("invariants") : 0;
-    }
-
-    std::vector<std::string> queryNames(const std::string& sql, const std::vector<std::string>& values) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        SqliteStatement stmt(db_, sql);
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            stmt.bindText(static_cast<int>(i + 1), values[i]);
-        }
-        std::vector<std::string> names;
-        while (stmt.step() == SQLITE_ROW) {
-            names.push_back(stmt.columnText(0));
-        }
-        return sortedUnique(std::move(names));
-    }
-};
-
-class PdRecordDatabase {
-public:
-    struct Record {
-        std::string name;
-        std::string pd;
-        std::string canonicalPd;
-    };
-
-    PdRecordDatabase(const std::filesystem::path& file, const NameCanonicalizer& names, bool loadTextIndex)
-        : file_(file), names_(names) {
-        if (loadTextIndex) {
-            load(file);
-        } else {
-            loadMessage_ = "PD_m text index skipped because SQLite data is available.";
-        }
-        addFallback("K0a1", "[]");
-        addFallback("K3a1", "[[1,5,2,4],[3,1,4,6],[5,3,6,2]]");
-    }
-
-    std::optional<std::string> lookup(const std::string& rawName, std::string& error) const {
-        const std::string name = names_.normalize(rawName);
-        if (name.empty()) {
-            error = "knot name should not be empty.";
-            return std::nullopt;
-        }
-        const auto exact = nameToOffset_.find(name);
-        if (exact != nameToOffset_.end()) {
-            const auto pd = readPdAt(exact->second);
-            if (pd.has_value()) return pd;
-            error = "could not read PD_m record for " + name + ".";
-            return std::nullopt;
-        }
-        const auto fallback = fallbackNameToPd_.find(name);
-        if (fallback != fallbackNameToPd_.end()) return fallback->second;
-        error = loaded_ ? "knot not found in PD_m_3-16.sorted.txt." : loadMessage_;
-        return std::nullopt;
-    }
-
-    std::vector<std::string> lookupByCanonicalPd(const std::string& canonicalPd) const {
-        const auto found = fallbackCanonicalPdToNames_.find(canonicalPd);
-        if (found == fallbackCanonicalPdToNames_.end()) return {};
-        return found->second;
-    }
-
-    template <typename Callback>
-    void forEachRecord(Callback callback) const {
-        if (!loaded_) return;
-        std::ifstream input(file_, std::ios::binary);
-        if (!input) throw std::runtime_error("cannot open PD_m database at " + cki::platform::displayPath(file_) + ".");
-
-        std::string line;
-        while (std::getline(input, line)) {
-            std::string name;
-            std::string pd;
-            if (!parseNamePdRecord(line, name, pd)) continue;
-            name = names_.normalize(name);
-            if (name.empty()) continue;
-            Record record{name, pd, ""};
-            if (!callback(record)) break;
-        }
-    }
-
-    bool loaded() const {
-        return loaded_;
-    }
-
-    std::string statusMessage() const {
-        return loaded_ ? ("indexed " + std::to_string(recordCount_) + " PD_m record names from " + cki::platform::displayPath(file_)) : loadMessage_;
-    }
-
-private:
-    std::filesystem::path file_;
-    const NameCanonicalizer& names_;
-    std::unordered_map<std::string, std::streamoff> nameToOffset_;
-    std::unordered_map<std::string, std::string> fallbackNameToPd_;
-    std::unordered_map<std::string, std::vector<std::string>> fallbackCanonicalPdToNames_;
-    std::size_t recordCount_ = 0;
-    bool loaded_ = false;
-    std::string loadMessage_ = "PD_m database is not installed.";
-
-    void addFallback(const std::string& rawName, const std::string& pd) {
-        const std::string name = names_.normalize(rawName);
-        if (fallbackNameToPd_.find(name) != fallbackNameToPd_.end()) return;
-        const std::optional<std::string> canonical = canonicalizePdText(pd);
-        fallbackNameToPd_[name] = pd;
-        if (canonical.has_value()) fallbackCanonicalPdToNames_[*canonical].push_back(name);
-    }
-
-    std::optional<std::string> readPdAt(std::streamoff offset) const {
-        std::ifstream input(file_, std::ios::binary);
-        if (!input) return std::nullopt;
-        input.seekg(offset);
-        std::string line;
-        if (!std::getline(input, line)) return std::nullopt;
-        std::string name;
-        std::string pd;
-        if (!parseNamePdRecord(line, name, pd)) return std::nullopt;
-        return pd;
-    }
-
-    void load(const std::filesystem::path& file) {
-        if (!existsPath(file)) {
-            loadMessage_ = "PD_m database not found at " + cki::platform::displayPath(file) + ".";
-            return;
-        }
-        std::ifstream input(file, std::ios::binary);
-        if (!input) {
-            loadMessage_ = "cannot open PD_m database at " + cki::platform::displayPath(file) + ".";
-            return;
-        }
-
-        std::string line;
-        std::streamoff offset = static_cast<std::streamoff>(input.tellg());
-        while (std::getline(input, line)) {
-            std::string name;
-            if (!parseNamePdName(line, name)) {
-                offset = static_cast<std::streamoff>(input.tellg());
-                continue;
-            }
-            name = names_.normalize(name);
-            if (!name.empty() && nameToOffset_.find(name) == nameToOffset_.end()) {
-                nameToOffset_[name] = offset;
-            }
-            ++recordCount_;
-            offset = static_cast<std::streamoff>(input.tellg());
-        }
-        loaded_ = recordCount_ > 0;
-        if (!loaded_) loadMessage_ = "PD_m database was found but no records could be loaded.";
-        for (auto& item : fallbackCanonicalPdToNames_) item.second = sortedUnique(std::move(item.second));
-    }
-};
-
-class PdInvariantIndex {
-public:
-    PdInvariantIndex(const std::filesystem::path& file, const NameCanonicalizer& names)
-        : file_(file), names_(names) {
-        load();
-    }
-
-    bool loaded() const {
-        return loaded_;
-    }
-
-    std::size_t size() const {
-        return indexedNames_.size();
-    }
-
-    bool hasName(const std::string& name) const {
-        return indexedNames_.find(name) != indexedNames_.end();
-    }
-
-    std::vector<std::string> lookup(const std::optional<std::string>& homfly,
-                                    const std::optional<std::string>& khovanov) const {
-        if (homfly.has_value() && khovanov.has_value()) {
-            const auto pairFound = pairToNames_.find(pairKey(*homfly, *khovanov));
-            if (pairFound != pairToNames_.end()) return pairFound->second;
-
-            const auto homFound = homflyToNames_.find(*homfly);
-            const auto khoFound = khovanovToNames_.find(*khovanov);
-            if (homFound != homflyToNames_.end() && khoFound != khovanovToNames_.end()) {
-                return intersectNames(homFound->second, khoFound->second);
-            }
-        }
-        if (khovanov.has_value()) {
-            const auto found = khovanovToNames_.find(*khovanov);
-            if (found != khovanovToNames_.end()) return found->second;
-        }
-        if (homfly.has_value()) {
-            const auto found = homflyToNames_.find(*homfly);
-            if (found != homflyToNames_.end()) return found->second;
-        }
-        return {};
-    }
-
-    std::string statusMessage() const {
-        if (!loaded_) return "PD_m invariant index not found at " + cki::platform::displayPath(file_) + ".";
-        return "loaded " + std::to_string(indexedNames_.size()) + " PD_m invariant records from " + cki::platform::displayPath(file_);
-    }
-
-    void append(const std::string& name,
-                const std::string& canonicalPd,
-                const std::string& homfly,
-                const std::string& khovanov) {
-        const std::string canonicalName = names_.normalize(name);
-        if (canonicalName.empty() || indexedNames_.find(canonicalName) != indexedNames_.end()) return;
-        std::filesystem::create_directories(file_.parent_path());
-        std::ofstream out(file_, std::ios::app);
-        if (!out) throw std::runtime_error("cannot append PD_m invariant index: " + cki::platform::displayPath(file_));
-        out << cleanFieldForTsv(canonicalName) << '\t'
-            << cleanFieldForTsv(canonicalPd) << '\t'
-            << cleanFieldForTsv(homfly) << '\t'
-            << cleanFieldForTsv(khovanov) << '\n';
-        add(canonicalName, homfly, khovanov);
-        loaded_ = true;
-    }
-
-private:
-    std::filesystem::path file_;
-    const NameCanonicalizer& names_;
-    bool loaded_ = false;
-    std::unordered_set<std::string> indexedNames_;
-    std::unordered_map<std::string, std::vector<std::string>> homflyToNames_;
-    std::unordered_map<std::string, std::vector<std::string>> khovanovToNames_;
-    std::unordered_map<std::string, std::vector<std::string>> pairToNames_;
-
-    static std::string pairKey(const std::string& homfly, const std::string& khovanov) {
-        return homfly + '\x1f' + khovanov;
-    }
-
-    void add(const std::string& rawName, const std::string& homfly, const std::string& khovanov) {
-        const std::string name = names_.normalize(rawName);
-        if (name.empty() || homfly.empty() || khovanov.empty()) return;
-        indexedNames_.insert(name);
-        homflyToNames_[homfly].push_back(name);
-        khovanovToNames_[khovanov].push_back(name);
-        pairToNames_[pairKey(homfly, khovanov)].push_back(name);
-    }
-
-    void load() {
-        if (!existsPath(file_)) return;
-        std::ifstream input(file_);
-        if (!input) throw std::runtime_error("cannot open PD_m invariant index: " + cki::platform::displayPath(file_));
-        std::string line;
-        while (std::getline(input, line)) {
-            line = trim(line);
-            if (line.empty() || line[0] == '#') continue;
-            const std::vector<std::string> parts = splitTabLine(line);
-            if (parts.size() < 4) continue;
-            add(parts[0], parts[2], parts[3]);
-        }
-        loaded_ = !indexedNames_.empty();
-        for (auto& item : homflyToNames_) item.second = sortedUnique(std::move(item.second));
-        for (auto& item : khovanovToNames_) item.second = sortedUnique(std::move(item.second));
-        for (auto& item : pairToNames_) item.second = sortedUnique(std::move(item.second));
-    }
-};
-
 class KnotEngine {
 public:
     KnotEngine(std::filesystem::path executable,
                DataPaths dataPaths,
                int timeoutSeconds,
-               int maxCrossing,
-               bool loadTextFallback)
+               int maxCrossing)
         : executable_(std::move(executable)),
           dataPaths_(std::move(dataPaths)),
           timeoutSeconds_(timeoutSeconds),
           maxCrossing_(maxCrossing),
-          nameCanonicalizer_(dataPaths_.knotNameRegDir),
-          sqliteStore_(dataPaths_.sqliteFile, nameCanonicalizer_),
-          pdRecords_(dataPaths_.namePdFile, nameCanonicalizer_, loadTextFallback && !sqliteStore_.hasPdRecords()),
-          invariantIndex_(dataPaths_.invariantIndexFile, nameCanonicalizer_) {}
+          nameNormalizer_(dataPaths_.knotNameRegDir),
+          homflyIndex_(hki::loadInvariantMap(dataPaths_.homflyDb, nameNormalizer_)),
+          khovanovIndex_(hki::loadInvariantMap(dataPaths_.khovanovDb, nameNormalizer_)) {}
 
     LookupResult lookup(const std::string& pdText,
-                        const std::shared_ptr<hki::CancellationToken>& cancellation = nullptr) {
+                        const std::shared_ptr<CancellationToken>& cancellation = nullptr) {
         const hki::PDCode pd = hki::parsePDCode(pdText);
         const std::string canonical = hki::formatPDCodeList(pd);
         const PdDiagram diagram = buildPdDiagram(canonical);
@@ -2493,86 +1454,19 @@ public:
             error = *crossingError;
             return std::nullopt;
         }
-        if (auto pd = sqliteStore_.lookupPd(knotName)) return pd;
-        return pdRecords_.lookup(knotName, error);
+        error = "name-to-PD lookup is unavailable in the upstream text invariant data mode.";
+        return std::nullopt;
     }
 
     std::string nameIndexStatus() const {
-        return sqliteStore_.statusMessage() + "\nText fallback: " + pdRecords_.statusMessage() + "\n" +
-               nameCanonicalizer_.statusMessage() + "\nInvariant index: " + invariantIndex_.statusMessage();
+        return "Invariant data source: text files " +
+               cki::platform::displayPath(dataPaths_.homflyDb) + " and " +
+               cki::platform::displayPath(dataPaths_.khovanovDb) +
+               "\nName normalization data: " + cki::platform::displayPath(dataPaths_.knotNameRegDir);
     }
 
     int maxCrossing() const {
         return maxCrossing_;
-    }
-
-    std::size_t buildSqliteNameDatabase(std::size_t limit) {
-        return sqliteStore_.importNamePdText(dataPaths_.namePdFile, limit);
-    }
-
-    std::size_t buildPdInvariantIndex(std::size_t limit,
-                                      std::size_t workers,
-                                      std::size_t batchSize,
-                                      int progressSeconds) {
-        if (sqliteStore_.hasPdRecords()) {
-            return buildSqliteInvariantIndex(limit, workers, batchSize, progressSeconds).written;
-        }
-        if (!pdRecords_.loaded()) {
-            throw std::runtime_error("PD_m_3-16.sorted.txt is required before building the invariant index.");
-        }
-
-        std::size_t built = 0;
-        std::size_t skipped = 0;
-        std::size_t outOfRange = 0;
-        std::size_t failed = 0;
-        pdRecords_.forEachRecord([&](const PdRecordDatabase::Record& record) -> bool {
-            if (limit > 0 && built >= limit) return false;
-            if (!shouldBuildInvariantForName(record.name)) {
-                ++outOfRange;
-                return true;
-            }
-            if (invariantIndex_.hasName(record.name)) {
-                ++skipped;
-                return true;
-            }
-            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
-            if (!canonicalPd.has_value()) {
-                ++skipped;
-                return true;
-            }
-
-            std::cerr << "indexing " << record.name << " (" << (built + 1) << " built so far)\n";
-            try {
-                LookupResult result = computeInvariants(*canonicalPd, nullptr, InvariantPipelineMode::OriginalOnly);
-                if (result.homflyWorker.success && result.khovanovWorker.success) {
-                    invariantIndex_.append(record.name, *canonicalPd, result.homfly, result.khovanov);
-                    ++built;
-                } else {
-                    ++failed;
-                    std::cerr << "warning: could not index " << record.name << ": ";
-                    if (!result.homflyWorker.success) {
-                        std::cerr << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
-                    }
-                    if (!result.homflyWorker.success && !result.khovanovWorker.success) std::cerr << "; ";
-                    if (!result.khovanovWorker.success) {
-                        std::cerr << workerFailureMessage("Khovanov", result.khovanovWorker);
-                    }
-                    std::cerr << "\n";
-                }
-            } catch (const std::exception& error) {
-                ++failed;
-                std::cerr << "warning: could not index " << record.name << ": " << error.what() << "\n";
-            }
-            return !hki::interrupted();
-        });
-
-        std::cerr << "PD_m invariant indexing complete: built " << built
-                  << ", skipped " << skipped << ", failed " << failed << ".\n";
-        if (outOfRange > 0) {
-            std::cerr << "PD_m invariant indexing ignored " << outOfRange
-                      << " records outside total crossing <= " << maxCrossing_ << ".\n";
-        }
-        return built;
     }
 
 private:
@@ -2580,40 +1474,19 @@ private:
     DataPaths dataPaths_;
     int timeoutSeconds_ = kMaxComputeTimeoutSeconds;
     int maxCrossing_ = kDefaultMaxCrossing;
-    NameCanonicalizer nameCanonicalizer_;
-    PdSqliteStore sqliteStore_;
-    PdRecordDatabase pdRecords_;
-    PdInvariantIndex invariantIndex_;
+    hki::NameNormalizer nameNormalizer_;
+    hki::InvariantMap homflyIndex_;
+    hki::InvariantMap khovanovIndex_;
     std::mutex cacheMutex_;
     std::unordered_map<std::string, LookupResult> cache_;
 
-    enum class IndexWorkStatus {
-        Success,
-        Skipped,
-        Failed,
-    };
-
-    struct IndexWorkResult {
-        IndexWorkStatus status = IndexWorkStatus::Failed;
-        PdSqliteStore::InvariantRecord invariant;
-        std::string name;
-        std::string error;
-    };
-
-    static std::size_t resolveIndexWorkerCount(std::size_t requested) {
-        if (requested > 0) return requested;
-        const unsigned int hardware = std::thread::hardware_concurrency();
-        if (hardware == 0) return 2;
-        return std::max<std::size_t>(1, static_cast<std::size_t>(hardware) / 2);
-    }
-
     std::optional<int> crossingNumberForName(const std::string& rawName) const {
-        const std::string canonicalName = nameCanonicalizer_.normalize(rawName);
+        const std::string canonicalName = nameNormalizer_.normalize(rawName);
         if (canonicalName.empty()) return std::nullopt;
         return totalKnotCrossings(canonicalName);
     }
 
-    bool shouldBuildInvariantForName(const std::string& rawName) const {
+    bool shouldKeepCandidateName(const std::string& rawName) const {
         const std::optional<int> crossings = crossingNumberForName(rawName);
         return crossings.has_value() && *crossings <= maxCrossing_;
     }
@@ -2627,323 +1500,9 @@ private:
 
     std::vector<std::string> filterNamesByMaxCrossing(std::vector<std::string> names) const {
         names.erase(std::remove_if(names.begin(), names.end(), [&](const std::string& name) {
-            return !shouldBuildInvariantForName(name);
+            return !shouldKeepCandidateName(name);
         }), names.end());
         return names;
-    }
-
-    std::size_t countEligibleSqliteInvariantRecords(std::size_t limit, std::size_t pageSize) {
-        std::size_t count = 0;
-        std::string lastName;
-        const std::size_t chunkSize = std::max<std::size_t>(1, pageSize);
-        while (!hki::interrupted()) {
-            std::vector<std::string> names = sqliteStore_.fetchUnindexedNamesAfter(lastName, chunkSize);
-            if (names.empty()) break;
-            lastName = names.back();
-            for (const std::string& name : names) {
-                if (!shouldBuildInvariantForName(name)) continue;
-                ++count;
-                if (limit > 0 && count >= limit) return count;
-            }
-            if (names.size() < chunkSize) break;
-        }
-        return count;
-    }
-
-    static void printIndexProgress(const IndexBuildStats& stats,
-                                   std::size_t totalTarget,
-                                   std::size_t workers,
-                                   std::chrono::steady_clock::time_point started,
-                                   bool final,
-                                   std::mutex& logMutex) {
-        const auto now = std::chrono::steady_clock::now();
-        const double elapsedSeconds =
-            std::max(0.001, std::chrono::duration<double>(now - started).count());
-        const std::size_t processed = stats.processed.load();
-        const std::size_t queued = stats.queued.load();
-        const std::size_t pending = queued > processed ? queued - processed : 0;
-        const double rate = static_cast<double>(processed) / elapsedSeconds;
-        const std::size_t remaining = totalTarget > processed ? totalTarget - processed : 0;
-        const std::uint64_t etaSeconds = final ? 0 : (rate > 0.0
-            ? static_cast<std::uint64_t>(std::ceil(static_cast<double>(remaining) / rate))
-            : 0);
-        const double percent = totalTarget > 0
-            ? (100.0 * static_cast<double>(std::min(processed, totalTarget)) / static_cast<double>(totalTarget))
-            : 100.0;
-
-        std::ostringstream line;
-        line << (final ? "PD_m index final: " : "PD_m index progress: ")
-             << processed << "/" << totalTarget
-             << " (" << std::fixed << std::setprecision(2) << percent << "%)"
-             << ", written " << stats.written.load()
-             << ", succeeded " << stats.succeeded.load()
-             << ", skipped " << stats.skipped.load()
-             << ", failed " << stats.failed.load()
-             << ", queued " << pending
-             << ", workers " << workers
-             << ", rate " << formatRate(rate) << "/s"
-             << ", elapsed " << formatDurationHms(static_cast<std::uint64_t>(elapsedSeconds))
-             << ", ETA " << formatDurationHms(etaSeconds);
-
-        std::lock_guard<std::mutex> lock(logMutex);
-        std::cerr << line.str() << "\n";
-    }
-
-    IndexBuildResult buildSqliteInvariantIndex(std::size_t limit,
-                                               std::size_t requestedWorkers,
-                                               std::size_t requestedBatchSize,
-                                               int progressSeconds) {
-        const std::size_t workers = resolveIndexWorkerCount(requestedWorkers);
-        const std::size_t batchSize = std::max<std::size_t>(1, requestedBatchSize);
-        const int progressIntervalSeconds = std::max(1, progressSeconds);
-        const std::size_t fetchChunk = std::max<std::size_t>(128, workers * 8);
-        const std::size_t recordFetchChunk = std::max<std::size_t>(4096, fetchChunk);
-        const std::size_t queueCapacity = std::max<std::size_t>(fetchChunk * 2, workers * 16);
-
-        sqliteStore_.beginInvariantBulkBuild();
-        bool bulkBuildOpen = true;
-
-        auto finishBulkBuild = [&] {
-            if (bulkBuildOpen) {
-                sqliteStore_.finishInvariantBulkBuild();
-                bulkBuildOpen = false;
-            }
-        };
-
-        try {
-            std::cerr << "Scanning SQLite PD_m records for unindexed knots with total crossing <= "
-                      << maxCrossing_ << ".\n";
-            const std::size_t totalTarget = countEligibleSqliteInvariantRecords(limit, recordFetchChunk);
-            IndexBuildResult summary;
-            summary.totalTarget = totalTarget;
-            if (totalTarget == 0) {
-                std::cerr << "SQLite invariant indexing complete: no eligible unindexed records remain.\n";
-                finishBulkBuild();
-                return summary;
-            }
-
-            std::cerr << "SQLite invariant indexing started: " << totalTarget
-                      << " eligible records (total crossing <= " << maxCrossing_
-                      << "), " << workers << " compute workers, batch size "
-                      << batchSize << ", progress interval " << progressIntervalSeconds << " seconds.\n";
-
-            BlockingQueue<PdSqliteStore::Record> inputQueue(queueCapacity);
-            BlockingQueue<IndexWorkResult> outputQueue(queueCapacity);
-            IndexBuildStats stats;
-            std::atomic_bool stopRequested{false};
-            std::atomic_bool reporterDone{false};
-            std::atomic_bool monitorDone{false};
-            std::mutex logMutex;
-            std::mutex errorMutex;
-            std::exception_ptr firstError;
-            auto cancellation = std::make_shared<hki::CancellationToken>();
-            const auto started = std::chrono::steady_clock::now();
-
-            auto requestStop = [&] {
-                const bool alreadyStopping = stopRequested.exchange(true);
-                cancellation->cancel();
-                inputQueue.close();
-                outputQueue.close();
-                reporterDone.store(true);
-                return !alreadyStopping;
-            };
-
-            auto setError = [&](std::exception_ptr error) {
-                {
-                    std::lock_guard<std::mutex> lock(errorMutex);
-                    if (!firstError) firstError = error;
-                }
-                requestStop();
-            };
-
-            std::thread interruptMonitor([&] {
-                while (!monitorDone.load()) {
-                    if (hki::interrupted()) {
-                        if (requestStop()) {
-                            std::lock_guard<std::mutex> lock(logMutex);
-                            std::cerr << "Interrupt requested; stopping PD_m invariant indexing after the current flush.\n";
-                        }
-                        break;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-            });
-
-            std::thread producer([&] {
-                try {
-                    std::string lastName;
-                    std::size_t submitted = 0;
-                    bool keepProducing = true;
-                    std::vector<std::string> eligibleNames;
-                    eligibleNames.reserve(fetchChunk);
-
-                    auto submitBufferedNames = [&]() -> bool {
-                        if (eligibleNames.empty()) return true;
-                        std::vector<PdSqliteStore::Record> records = sqliteStore_.fetchRecordsByNames(eligibleNames);
-                        eligibleNames.clear();
-                        for (PdSqliteStore::Record& record : records) {
-                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) return false;
-                            if (!inputQueue.push(std::move(record), stopRequested)) return false;
-                            ++submitted;
-                            ++stats.queued;
-                        }
-                        return true;
-                    };
-
-                    while (keepProducing && !stopRequested.load() && !hki::interrupted() && submitted < totalTarget) {
-                        std::vector<std::string> names =
-                            sqliteStore_.fetchUnindexedNamesAfter(lastName, recordFetchChunk);
-                        if (names.empty()) break;
-                        lastName = names.back();
-                        for (const std::string& name : names) {
-                            if (stopRequested.load() || hki::interrupted() || submitted >= totalTarget) break;
-                            if (submitted + eligibleNames.size() >= totalTarget) break;
-                            if (!shouldBuildInvariantForName(name)) continue;
-                            eligibleNames.push_back(name);
-                            if (eligibleNames.size() >= fetchChunk && !submitBufferedNames()) {
-                                keepProducing = false;
-                                break;
-                            }
-                        }
-                        if (names.size() < recordFetchChunk) break;
-                    }
-                    if (keepProducing) submitBufferedNames();
-                } catch (...) {
-                    setError(std::current_exception());
-                }
-                inputQueue.close();
-            });
-
-            std::vector<std::thread> computeThreads;
-            computeThreads.reserve(workers);
-            for (std::size_t workerIndex = 0; workerIndex < workers; ++workerIndex) {
-                computeThreads.emplace_back([&] {
-                    PdSqliteStore::Record record;
-                    while (inputQueue.pop(record, stopRequested)) {
-                        if (stopRequested.load() || hki::interrupted()) break;
-                        IndexWorkResult work;
-                        work.name = record.name;
-                        try {
-                            const std::optional<std::string> canonicalPd = canonicalizePdText(record.pd);
-                            if (!canonicalPd.has_value()) {
-                                work.status = IndexWorkStatus::Skipped;
-                                work.error = "invalid PD code";
-                            } else {
-                                LookupResult result = computeInvariants(
-                                    *canonicalPd,
-                                    cancellation,
-                                    InvariantPipelineMode::OriginalOnly);
-                                if (result.homflyWorker.success && result.khovanovWorker.success) {
-                                    work.status = IndexWorkStatus::Success;
-                                    work.invariant = PdSqliteStore::InvariantRecord{
-                                        record.name,
-                                        *canonicalPd,
-                                        result.homfly,
-                                        result.khovanov,
-                                    };
-                                } else {
-                                    work.status = IndexWorkStatus::Failed;
-                                    std::ostringstream error;
-                                    if (!result.homflyWorker.success) {
-                                        error << workerFailureMessage("HOMFLY-PT", result.homflyWorker);
-                                    }
-                                    if (!result.homflyWorker.success && !result.khovanovWorker.success) error << "; ";
-                                    if (!result.khovanovWorker.success) {
-                                        error << workerFailureMessage("Khovanov", result.khovanovWorker);
-                                    }
-                                    work.error = error.str();
-                                }
-                            }
-                        } catch (const std::exception& error) {
-                            if (stopRequested.load() || hki::interrupted()) break;
-                            work.status = IndexWorkStatus::Failed;
-                            work.error = error.what();
-                        }
-                        if (!outputQueue.push(std::move(work), stopRequested)) break;
-                    }
-                });
-            }
-
-            std::thread writer([&] {
-                std::vector<PdSqliteStore::InvariantRecord> batch;
-                batch.reserve(batchSize);
-                std::size_t failureLogs = 0;
-
-                auto flush = [&] {
-                    if (batch.empty()) return;
-                    const std::size_t written = sqliteStore_.appendInvariantBatch(batch);
-                    stats.written.fetch_add(written);
-                    batch.clear();
-                };
-
-                try {
-                    IndexWorkResult work;
-                    while (outputQueue.pop(work, stopRequested)) {
-                        if (work.status == IndexWorkStatus::Success) {
-                            ++stats.succeeded;
-                            batch.push_back(std::move(work.invariant));
-                            if (batch.size() >= batchSize) flush();
-                        } else if (work.status == IndexWorkStatus::Skipped) {
-                            ++stats.skipped;
-                        } else {
-                            ++stats.failed;
-                            if (failureLogs < 20) {
-                                std::lock_guard<std::mutex> lock(logMutex);
-                                std::cerr << "warning: could not index " << work.name << ": "
-                                          << work.error << "\n";
-                            } else if (failureLogs == 20) {
-                                std::lock_guard<std::mutex> lock(logMutex);
-                                std::cerr << "warning: suppressing further per-record indexing failures.\n";
-                            }
-                            ++failureLogs;
-                        }
-                        ++stats.processed;
-                    }
-                    flush();
-                } catch (...) {
-                    setError(std::current_exception());
-                }
-            });
-
-            std::thread reporter([&] {
-                while (!reporterDone.load() && !stopRequested.load()) {
-                    for (int i = 0; i < progressIntervalSeconds && !reporterDone.load() && !stopRequested.load(); ++i) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                    }
-                    if (!reporterDone.load() && !stopRequested.load()) {
-                        printIndexProgress(stats, totalTarget, workers, started, false, logMutex);
-                    }
-                }
-            });
-
-            producer.join();
-            for (std::thread& thread : computeThreads) thread.join();
-            outputQueue.close();
-            writer.join();
-            monitorDone.store(true);
-            interruptMonitor.join();
-            reporterDone.store(true);
-            reporter.join();
-
-            if (firstError) std::rethrow_exception(firstError);
-            if (hki::interrupted()) {
-                std::cerr << "SQLite invariant indexing interrupted.\n";
-            }
-
-            finishBulkBuild();
-            printIndexProgress(stats, totalTarget, workers, started, true, logMutex);
-
-            summary.written = stats.written.load();
-            summary.skipped = stats.skipped.load();
-            summary.failed = stats.failed.load();
-            std::cerr << "SQLite invariant indexing complete: built " << summary.written
-                      << ", skipped " << summary.skipped
-                      << ", failed " << summary.failed << ".\n";
-            return summary;
-        } catch (...) {
-            finishBulkBuild();
-            throw;
-        }
     }
 
     enum class InvariantKind {
@@ -3018,7 +1577,7 @@ private:
     }
 
     LookupResult computeInvariants(const std::string& canonicalPd,
-                                   const std::shared_ptr<hki::CancellationToken>& cancellation,
+                                   const std::shared_ptr<CancellationToken>& cancellation,
                                    InvariantPipelineMode mode) {
         const auto deadline = timeoutSeconds_ > 0
             ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds_)
@@ -3159,7 +1718,7 @@ private:
     }
 
     LookupResult compute(const std::string& canonicalPd,
-                         const std::shared_ptr<hki::CancellationToken>& cancellation) {
+                         const std::shared_ptr<CancellationToken>& cancellation) {
         LookupResult result = computeInvariants(canonicalPd, cancellation, InvariantPipelineMode::SimplifyRetry);
 
         std::optional<std::string> homfly;
@@ -3167,27 +1726,13 @@ private:
         if (!result.homfly.empty()) homfly = result.homfly;
         if (!result.khovanov.empty()) khovanov = result.khovanov;
 
-        result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupInvariants(homfly, khovanov));
-        if (result.candidates.empty()) {
-            result.candidates = filterNamesByMaxCrossing(invariantIndex_.lookup(homfly, khovanov));
-        }
-        if (result.candidates.empty()) {
-            result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupByCanonicalPd(result.canonicalPd));
-            if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
-                result.candidates = filterNamesByMaxCrossing(sqliteStore_.lookupByCanonicalPd(canonicalPd));
-            }
-        }
-        if (result.candidates.empty()) {
-            result.candidates = filterNamesByMaxCrossing(pdRecords_.lookupByCanonicalPd(result.canonicalPd));
-            if (result.candidates.empty() && result.canonicalPd != canonicalPd) {
-                result.candidates = filterNamesByMaxCrossing(pdRecords_.lookupByCanonicalPd(canonicalPd));
-            }
-        }
-        if (result.candidates.empty() && !sqliteStore_.hasInvariantRecords() && !invariantIndex_.loaded()) {
-            result.candidateError =
-                "PD_m invariant index is not built. Generate PD_m_3-16.sqlite with --build-sqlite, "
-                "then run --build-pd-index.";
-        }
+        const std::vector<std::string> khovanovNames =
+            khovanov.has_value() ? hki::lookupInvariant(khovanovIndex_, *khovanov) : std::vector<std::string>{};
+        const std::vector<std::string> homflyNames =
+            homfly.has_value() ? hki::lookupInvariant(homflyIndex_, *homfly) : std::vector<std::string>{};
+
+        result.candidates = filterNamesByMaxCrossing(
+            mergeCandidates(result.khovanovWorker, khovanovNames, result.homflyWorker, homflyNames));
         return result;
     }
 };
@@ -3550,7 +2095,7 @@ private:
             info << "Pure C++ knot-indexer-lab server\n"
                  << "Invariant timeout: " << kMaxComputeTimeoutSeconds << " seconds\n"
                  << "Maximum total crossing number: " << engine_.maxCrossing() << "\n"
-                 << "PD_m data: " << engine_.nameIndexStatus() << "\n";
+                 << "Invariant data: " << engine_.nameIndexStatus() << "\n";
             return makeText(200, "OK", info.str(), "text/plain; charset=utf-8");
         }
 
@@ -3701,16 +2246,10 @@ void usage(std::ostream& out) {
         << "Options:\n"
         << "  --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0\n"
         << "  --port PORT          TCP port. Default: 5000\n"
-        << "  --data-folder PATH   Folder containing name-pd/PD_m_3-16.sorted.txt and knotname-reg/.\n"
+        << "  --data-folder PATH   Folder containing homfly/, khovanov/, and knotname-reg/.\n"
         << "  --web-root PATH      Folder containing index.html and static/.\n"
         << "  --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200\n"
-        << "  --build-sqlite       Import PD_m_3-16.sorted.txt into PD_m_3-16.sqlite, then exit.\n"
-        << "  --build-pd-index     Generate invariant records in SQLite or TSV fallback, then exit.\n"
         << "  --max-crossing N     Maximum total crossing number. Default: 14, max: 16\n"
-        << "  --index-limit N      Limit newly imported or indexed records in build modes.\n"
-        << "  --index-workers N    Parallel PD_m invariant build workers. Default: half of CPU cores.\n"
-        << "  --index-batch-size N SQLite invariant rows per write transaction. Default: 256\n"
-        << "  --index-progress-seconds N  Progress/ETA refresh interval. Default: 5\n"
         << "  --help, -h           Show this help text.\n";
 }
 
@@ -3751,23 +2290,11 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             if (options.timeoutSeconds > kMaxComputeTimeoutSeconds) {
                 throw std::runtime_error("--timeout must not exceed 1200 seconds");
             }
-        } else if (arg == "--build-sqlite") {
-            options.buildSqlite = true;
-        } else if (arg == "--build-pd-index") {
-            options.buildPdIndex = true;
         } else if (arg == "--max-crossing") {
             options.maxCrossing = parsePositiveInt(needValue("--max-crossing").text, "--max-crossing");
             if (options.maxCrossing > kHardMaxCrossing) {
                 throw std::runtime_error("--max-crossing must not exceed 16");
             }
-        } else if (arg == "--index-limit") {
-            options.indexLimit = static_cast<std::size_t>(parsePositiveInt(needValue("--index-limit").text, "--index-limit"));
-        } else if (arg == "--index-workers") {
-            options.indexWorkers = static_cast<std::size_t>(parsePositiveInt(needValue("--index-workers").text, "--index-workers"));
-        } else if (arg == "--index-batch-size") {
-            options.indexBatchSize = static_cast<std::size_t>(parsePositiveInt(needValue("--index-batch-size").text, "--index-batch-size"));
-        } else if (arg == "--index-progress-seconds") {
-            options.indexProgressSeconds = parsePositiveInt(needValue("--index-progress-seconds").text, "--index-progress-seconds");
         } else if (arg == "--worker") {
             return options;
         } else {
@@ -3794,18 +2321,7 @@ int main(int argc, char** argv) {
         const lab::Options options = lab::parseOptions(args);
         const std::filesystem::path executable = lab::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
-        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing, !options.buildSqlite);
-        if (options.buildSqlite) {
-            engine.buildSqliteNameDatabase(options.indexLimit);
-        }
-        if (options.buildPdIndex) {
-            engine.buildPdInvariantIndex(options.indexLimit,
-                                         options.indexWorkers,
-                                         options.indexBatchSize,
-                                         options.indexProgressSeconds);
-            return 0;
-        }
-        if (options.buildSqlite) return 0;
+        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing);
 
         const std::filesystem::path webRoot = lab::resolveWebRoot(executable, options.webRoot);
         lab::TaskManager tasks;
