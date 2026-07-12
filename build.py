@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "third_party" / "cpp_knot_indexer"
 SQLITE = ROOT / "third_party" / "sqlite" / "sqlite-amalgamation-3530300"
+PD_CODE_TO_DIAGRAM = ROOT / "third_party" / "pd_code_to_diagram" / "cpp_src"
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 TARGET_NAME = "knot_indexer_lab_server" + EXE_SUFFIX
 
@@ -154,6 +155,7 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
         "-I", str(VENDOR / "src" / "link_pd_code"),
         "-I", str(VENDOR / "third_party" / "cpp-pd-code-simplify" / "include"),
         "-I", str(VENDOR / "third_party" / "libhomfly"),
+        "-I", str(PD_CODE_TO_DIAGRAM),
     ]
 
     if not args.debug:
