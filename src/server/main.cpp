@@ -139,6 +139,8 @@ struct Response {
 
 struct LookupResult {
     std::string canonicalPd;
+    std::string pdDiagramSvg;
+    std::string pdDiagramError;
     std::string homfly;
     std::string khovanov;
     std::vector<std::string> candidates;
@@ -759,6 +761,8 @@ struct TaskRecord {
     std::string inputType;
     std::string input;
     std::string canonicalPd;
+    std::string pdDiagramSvg;
+    std::string pdDiagramError;
     std::string knotTypes;
     std::string homflyStatus = "pending";
     std::string homflyResult;
@@ -809,16 +813,23 @@ public:
         return false;
     }
 
-    void setCanonicalPd(const TaskPtr& task, const std::string& canonicalPd) {
+    void setCanonicalPd(const TaskPtr& task,
+                        const std::string& canonicalPd,
+                        const std::string& pdDiagramSvg,
+                        const std::string& pdDiagramError) {
         if (!task) return;
         std::lock_guard<std::mutex> lock(mutex_);
         task->canonicalPd = canonicalPd;
+        task->pdDiagramSvg = pdDiagramSvg;
+        task->pdDiagramError = pdDiagramError;
     }
 
     void complete(const TaskPtr& task, const LookupResult& result) {
         if (!task) return;
         std::lock_guard<std::mutex> lock(mutex_);
         task->canonicalPd = result.canonicalPd;
+        task->pdDiagramSvg = result.pdDiagramSvg;
+        task->pdDiagramError = result.pdDiagramError;
         task->knotTypes = join(result.candidates, "; ");
         task->homflyStatus = workerStatusText(result.homflyWorker);
         task->homflyResult = result.homfly;
@@ -890,6 +901,8 @@ private:
             << "\"input_type\":\"" << jsonEscape(task.inputType) << "\","
             << "\"input\":\"" << jsonEscape(task.input) << "\","
             << "\"canonical_pd\":\"" << jsonEscape(task.canonicalPd) << "\","
+            << "\"pd_diagram_svg\":\"" << jsonEscape(task.pdDiagramSvg) << "\","
+            << "\"pd_diagram_error\":\"" << jsonEscape(task.pdDiagramError) << "\","
             << "\"started_at\":\"" << jsonEscape(task.startedAt) << "\","
             << "\"ended_at\":\"" << jsonEscape(task.endedAt) << "\","
             << "\"knot_types\":\"" << jsonEscape(task.knotTypes) << "\","
@@ -1165,6 +1178,258 @@ std::optional<std::string> canonicalizePdText(const std::string& pdText) {
         return hki::formatPDCodeList(hki::parsePDCode(pdText));
     } catch (const std::exception&) {
         return std::nullopt;
+    }
+}
+
+int diagramPairedPos(int pos) {
+    if (pos < 0 || pos >= 4) throw std::runtime_error("invalid crossing slot");
+    return (pos + 2) % 4;
+}
+
+std::map<int, std::vector<int>> diagramLabelPairedNeighbors(const hki::PDCode& pd) {
+    std::map<int, std::vector<int>> neighbors;
+    for (const hki::Crossing& crossing : pd) {
+        for (int pos = 0; pos < 4; ++pos) {
+            neighbors[crossing[pos]].push_back(crossing[diagramPairedPos(pos)]);
+        }
+    }
+    return neighbors;
+}
+
+std::vector<std::vector<int>> diagramComponentsFromPdCode(const hki::PDCode& pd) {
+    hki::validatePDCode(pd);
+    std::map<int, std::set<int>> graph;
+    for (const hki::Crossing& crossing : pd) {
+        graph[crossing[0]].insert(crossing[2]);
+        graph[crossing[2]].insert(crossing[0]);
+        graph[crossing[1]].insert(crossing[3]);
+        graph[crossing[3]].insert(crossing[1]);
+    }
+
+    std::set<int> visited;
+    std::vector<std::vector<int>> components;
+    for (const auto& item : graph) {
+        const int start = item.first;
+        if (visited.count(start)) continue;
+        std::vector<int> component;
+        std::vector<int> stack{start};
+        visited.insert(start);
+        while (!stack.empty()) {
+            const int now = stack.back();
+            stack.pop_back();
+            component.push_back(now);
+            for (int next : graph[now]) {
+                if (!visited.count(next)) {
+                    visited.insert(next);
+                    stack.push_back(next);
+                }
+            }
+        }
+        std::sort(component.begin(), component.end());
+        components.push_back(std::move(component));
+    }
+    std::sort(components.begin(), components.end());
+    return components;
+}
+
+std::vector<int> diagramWalkCycle(const std::map<int, std::set<int>>& graph,
+                                  int start,
+                                  int firstNext,
+                                  std::size_t expected) {
+    std::vector<int> cycle;
+    cycle.reserve(expected);
+    int current = start;
+    int next = firstNext;
+    cycle.push_back(start);
+    for (;;) {
+        if (next == start) break;
+        cycle.push_back(next);
+        if (cycle.size() > expected) throw std::runtime_error("PD component cycle did not close");
+        const auto& options = graph.at(next);
+        int candidate = -1;
+        for (int item : options) {
+            if (item != current) {
+                candidate = item;
+                break;
+            }
+        }
+        if (candidate < 0) candidate = start;
+        current = next;
+        next = candidate;
+    }
+    if (cycle.size() != expected) throw std::runtime_error("PD component cycle length mismatch");
+    return cycle;
+}
+
+std::vector<int> diagramCanonicalCycleForComponent(const hki::PDCode& pd,
+                                                   const std::vector<int>& component) {
+    if (component.empty()) return {};
+    if (component.size() <= 2) return component;
+
+    const auto paired = diagramLabelPairedNeighbors(pd);
+    const std::set<int> componentSet(component.begin(), component.end());
+    std::map<int, std::set<int>> graph;
+    for (int label : component) {
+        const auto found = paired.find(label);
+        if (found == paired.end()) throw std::runtime_error("PD label is missing from paired-neighbor map");
+        for (int neighbor : found->second) {
+            if (componentSet.count(neighbor)) graph[label].insert(neighbor);
+        }
+        if (graph[label].size() != 2) throw std::runtime_error("PD component is not a simple cycle");
+    }
+
+    const int start = *std::min_element(component.begin(), component.end());
+    std::vector<std::vector<int>> candidates;
+    for (int firstNext : graph[start]) {
+        candidates.push_back(diagramWalkCycle(graph, start, firstNext, component.size()));
+    }
+    if (candidates.size() != 2) throw std::runtime_error("expected two PD component cycle orientations");
+    return std::lexicographical_compare(
+               candidates[1].begin(), candidates[1].end(),
+               candidates[0].begin(), candidates[0].end())
+               ? candidates[1]
+               : candidates[0];
+}
+
+std::vector<std::vector<int>> diagramCanonicalCycles(const hki::PDCode& pd) {
+    std::vector<std::vector<int>> components = diagramComponentsFromPdCode(pd);
+    std::vector<std::vector<int>> cycles;
+    cycles.reserve(components.size());
+    for (const std::vector<int>& component : components) {
+        cycles.push_back(diagramCanonicalCycleForComponent(pd, component));
+    }
+    std::sort(cycles.begin(), cycles.end());
+    return cycles;
+}
+
+std::string xmlEscape(const std::string& text) {
+    std::string out;
+    for (char ch : text) {
+        switch (ch) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default: out.push_back(ch); break;
+        }
+    }
+    return out;
+}
+
+struct SvgPoint {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+std::string svgNumber(double value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(1) << value;
+    return out.str();
+}
+
+std::string diagramCrossingSignText(const hki::Crossing& crossing) {
+    const int b = crossing[1];
+    const int d = crossing[3];
+    if (b - d == 1 || d - b > 1) return "+";
+    if (d - b == 1 || b - d > 1) return "-";
+    return "?";
+}
+
+std::string renderPdCodeSvg(const hki::PDCode& pd, const std::string& title) {
+    hki::validatePDCode(pd);
+    const std::vector<std::vector<int>> cycles = diagramCanonicalCycles(pd);
+    const double pi = std::acos(-1.0);
+    const int cellW = 300;
+    const int cellH = 260;
+    const int cols = cycles.size() <= 1 ? 1 : 2;
+    const int rows = std::max<int>(1, static_cast<int>((cycles.size() + cols - 1) / cols));
+    const int tableW = 400;
+    const int width = cols * cellW + tableW + 60;
+    const int tableHeight = 100 + static_cast<int>(pd.size()) * 20;
+    const int height = std::max({260, rows * cellH + 60, tableHeight});
+
+    std::ostringstream svg;
+    svg << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width
+        << "\" height=\"" << height << "\" viewBox=\"0 0 " << width << " " << height
+        << "\" role=\"img\" aria-label=\"" << xmlEscape(title) << "\">\n";
+    svg << "<rect width=\"100%\" height=\"100%\" fill=\"white\"/>\n";
+    svg << "<style>text{font-family:Arial,DejaVu Sans,sans-serif;font-size:13px;fill:#111}"
+        << ".small{font-size:11px}.title{font-size:16px;font-weight:bold}"
+        << ".strand{fill:none;stroke:#111;stroke-width:3;stroke-linejoin:round}"
+        << ".socket{fill:#fff;stroke:#b00020;stroke-width:1.5}</style>\n";
+    svg << "<text class=\"title\" x=\"20\" y=\"28\">" << xmlEscape(title) << "</text>\n";
+
+    if (cycles.empty()) {
+        svg << "<circle cx=\"130\" cy=\"135\" r=\"70\" fill=\"none\" stroke=\"#111\" stroke-width=\"3\"/>\n";
+        svg << "<text x=\"88\" y=\"140\">unknot / empty PD</text>\n";
+    }
+
+    for (std::size_t c = 0; c < cycles.size(); ++c) {
+        const int gridX = static_cast<int>(c % cols);
+        const int gridY = static_cast<int>(c / cols);
+        const double ox = 30 + gridX * cellW;
+        const double oy = 50 + gridY * cellH;
+        const double cx = ox + cellW / 2.0;
+        const double cy = oy + cellH / 2.0;
+        const double rx = 95;
+        const double ry = 75;
+        const std::vector<int>& cycle = cycles[c];
+        std::vector<SvgPoint> points;
+        points.reserve(cycle.size());
+        for (std::size_t i = 0; i < cycle.size(); ++i) {
+            const double angle = -pi / 2.0 + 2.0 * pi * static_cast<double>(i) /
+                                                std::max<std::size_t>(1, cycle.size());
+            points.push_back({cx + rx * std::cos(angle), cy + ry * std::sin(angle)});
+        }
+
+        svg << "<text x=\"" << svgNumber(ox + 8) << "\" y=\"" << svgNumber(oy + 20)
+            << "\">component " << (c + 1) << "</text>\n";
+        if (points.size() == 1) {
+            svg << "<circle class=\"strand\" cx=\"" << svgNumber(points[0].x)
+                << "\" cy=\"" << svgNumber(points[0].y) << "\" r=\"45\"/>\n";
+        } else if (!points.empty()) {
+            svg << "<polyline class=\"strand\" points=\"";
+            for (const SvgPoint& point : points) {
+                svg << svgNumber(point.x) << "," << svgNumber(point.y) << " ";
+            }
+            svg << svgNumber(points[0].x) << "," << svgNumber(points[0].y) << "\"/>\n";
+        }
+
+        for (std::size_t i = 0; i < points.size(); ++i) {
+            const SvgPoint& point = points[i];
+            svg << "<circle class=\"socket\" cx=\"" << svgNumber(point.x) << "\" cy=\""
+                << svgNumber(point.y) << "\" r=\"9\"/>\n";
+            svg << "<text class=\"small\" text-anchor=\"middle\" x=\"" << svgNumber(point.x)
+                << "\" y=\"" << svgNumber(point.y + 4) << "\">" << cycle[i] << "</text>\n";
+        }
+    }
+
+    const int tableX = cols * cellW + 35;
+    svg << "<text class=\"title\" x=\"" << tableX << "\" y=\"58\">PD crossings</text>\n";
+    int y = 82;
+    for (std::size_t i = 0; i < pd.size(); ++i) {
+        svg << "<text x=\"" << tableX << "\" y=\"" << y << "\">X" << (i + 1)
+            << " (" << diagramCrossingSignText(pd[i]) << ") = ["
+            << pd[i][0] << ", " << pd[i][1] << ", " << pd[i][2] << ", " << pd[i][3]
+            << "]</text>\n";
+        y += 20;
+    }
+    svg << "</svg>";
+    return svg.str();
+}
+
+struct PdDiagram {
+    std::string svg;
+    std::string error;
+};
+
+PdDiagram buildPdDiagram(const std::string& pdText) {
+    try {
+        const hki::PDCode pd = hki::parsePDCode(pdText);
+        return PdDiagram{renderPdCodeSvg(pd, "PD Diagram"), ""};
+    } catch (const std::exception& error) {
+        return PdDiagram{"", error.what()};
     }
 }
 
@@ -1986,13 +2251,21 @@ public:
                         const std::shared_ptr<hki::CancellationToken>& cancellation = nullptr) {
         const hki::PDCode pd = hki::parsePDCode(pdText);
         const std::string canonical = hki::formatPDCodeList(pd);
+        const PdDiagram diagram = buildPdDiagram(canonical);
         {
             std::lock_guard<std::mutex> lock(cacheMutex_);
             const auto found = cache_.find(canonical);
-            if (found != cache_.end()) return found->second;
+            if (found != cache_.end()) {
+                LookupResult cached = found->second;
+                cached.pdDiagramSvg = diagram.svg;
+                cached.pdDiagramError = diagram.error;
+                return cached;
+            }
         }
 
         LookupResult result = compute(canonical, cancellation);
+        result.pdDiagramSvg = diagram.svg;
+        result.pdDiagramError = diagram.error;
         const bool cacheable = !result.homflyWorker.cancelled &&
                                !result.khovanovWorker.cancelled &&
                                (result.homflyWorker.success || result.khovanovWorker.success);
@@ -3077,7 +3350,8 @@ private:
         auto task = tasks_.create(clientId, inputType, input);
         try {
             const std::string pd = resolvePd();
-            tasks_.setCanonicalPd(task, pd);
+            const PdDiagram diagram = buildPdDiagram(pd);
+            tasks_.setCanonicalPd(task, pd, diagram.svg, diagram.error);
             const LookupResult result = engine_.lookup(pd, task->cancellation);
             tasks_.complete(task, result);
             return makeLookupJson(task, result);
@@ -3106,6 +3380,8 @@ private:
             << "\"message\":\"" << jsonEscape(message) << "\","
             << "\"task_id\":" << (task ? task->id : 0) << ","
             << "\"pd_code\":\"" << jsonEscape(result.canonicalPd) << "\","
+            << "\"pd_diagram_svg\":\"" << jsonEscape(result.pdDiagramSvg) << "\","
+            << "\"pd_diagram_error\":\"" << jsonEscape(result.pdDiagramError) << "\","
             << "\"knot_name\":\"" << jsonEscape(join(result.candidates, "; ")) << "\","
             << "\"homfly_status\":\"" << jsonEscape(workerStatusText(result.homflyWorker)) << "\","
             << "\"homflypt_polynomial\":\"" << jsonEscape(result.homfly) << "\","
@@ -3122,7 +3398,10 @@ private:
         out << "{"
             << "\"status\":\"error\","
             << "\"message\":\"" << jsonEscape(error) << "\","
-            << "\"task_id\":" << (task ? task->id : 0)
+            << "\"task_id\":" << (task ? task->id : 0) << ","
+            << "\"pd_code\":\"" << jsonEscape(task ? task->canonicalPd : "") << "\","
+            << "\"pd_diagram_svg\":\"" << jsonEscape(task ? task->pdDiagramSvg : "") << "\","
+            << "\"pd_diagram_error\":\"" << jsonEscape(task ? task->pdDiagramError : "") << "\""
             << "}";
         return makeText(200, "OK", out.str(), "application/json; charset=utf-8");
     }

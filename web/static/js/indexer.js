@@ -25,6 +25,8 @@ export default {
 
       knot_name_list: "...",
       knot_pd_code: "...",
+      knot_pd_diagram_svg: "",
+      knot_pd_diagram_error: "",
       homflypt_polynomial: "...",
       khovanov_homology: "...",
       taskSocket: null,
@@ -106,6 +108,8 @@ export default {
         task.id,
         task.status,
         task.canonical_pd,
+        task.pd_diagram_svg,
+        task.pd_diagram_error,
         task.knot_types,
         task.homfly_status,
         task.homfly_result,
@@ -123,6 +127,8 @@ export default {
       this.restoredTaskSignature = signature;
 
       this.knot_pd_code = task.canonical_pd || "...";
+      this.knot_pd_diagram_svg = task.pd_diagram_svg || "";
+      this.knot_pd_diagram_error = task.pd_diagram_error || "";
       if (task.knot_types) {
         this.knot_name_list = task.knot_types;
       } else if (task.status === "running") {
@@ -175,6 +181,8 @@ export default {
     applyIndexResult(result, fallbackName = "") {
       this.knot_name_list = result.knot_name || fallbackName || "NOT_FOUND";
       this.knot_pd_code = result.pd_code || "...";
+      this.knot_pd_diagram_svg = result.pd_diagram_svg || "";
+      this.knot_pd_diagram_error = result.pd_diagram_error || "";
       this.homflypt_polynomial = this.formatInvariant(result.homfly_status, result.homflypt_polynomial, result.homfly_error);
       this.khovanov_homology = this.expandComma(this.formatInvariant(result.khovanov_status, result.khovanov_homology, result.khovanov_error));
     },
@@ -216,6 +224,8 @@ export default {
     clearKnotInfoData() {
       this.knot_name_list = "...";
       this.knot_pd_code = "...";
+      this.knot_pd_diagram_svg = "";
+      this.knot_pd_diagram_error = "";
       this.homflypt_polynomial = "...";
       this.khovanov_homology = "...";
     },
@@ -508,6 +518,12 @@ export default {
     <div class="row mt-2">
       <div v-html="knot_name_search_status" class="text-center"></div>
     </div>
+
+    <section v-if="knot_pd_diagram_svg || knot_pd_diagram_error" class="pd-diagram-section mt-3">
+      <h2 class="h5">PD Diagram</h2>
+      <div v-if="knot_pd_diagram_svg" class="pd-diagram-panel" v-html="knot_pd_diagram_svg"></div>
+      <div v-if="knot_pd_diagram_error" class="alert alert-warning mt-2 mb-0">{{ knot_pd_diagram_error }}</div>
+    </section>
 
     <table class="table mt-2">
       <tbody>
