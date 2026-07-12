@@ -2198,7 +2198,13 @@ std::vector<cki::link_pd_code::Point3> parseCoordinateRows(const std::string& ra
     std::istringstream input(text);
     std::vector<double> values;
     double v = 0.0;
-    while (input >> v) values.push_back(v);
+    while (input >> v) {
+        if (!std::isfinite(v)) throw std::runtime_error("3D coordinates must be finite numbers.");
+        values.push_back(v);
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("3D coordinate list contains a non-numeric value.");
+    }
     if (values.size() % 3 == 1 && values.front() >= 3.0) {
         const double count = values.front();
         const std::size_t pointCount = (values.size() - 1) / 3;
@@ -2361,9 +2367,13 @@ private:
         if (request.method == "POST" && request.path == "/api/coord_3d2pd_code") {
             const auto coordText = extractJsonString(request.body, "coord_3d");
             if (!coordText.has_value()) return makeJsonError("coord_3d JSON string is required.");
-            const auto points = parseCoordinateRows(*coordText);
-            const cki::link_pd_code::PDCode pd = cki::link_pd_code::computePDCode(points);
-            return makeJsonSuccess(cki::link_pd_code::formatPDCode(pd));
+            try {
+                const auto points = parseCoordinateRows(*coordText);
+                const cki::link_pd_code::PDCode pd = cki::link_pd_code::computePDCode(points);
+                return makeJsonSuccess(cki::link_pd_code::formatPDCode(pd));
+            } catch (const std::exception& error) {
+                return makeJsonError(error.what());
+            }
         }
 
         if (request.method == "GET" && request.path == "/api/last_build_info") {

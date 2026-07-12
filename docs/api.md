@@ -14,6 +14,14 @@ POST /api/index_coord_3d
 These endpoints create a computation task and return a lookup result object.
 The coordinate endpoint accepts JSON with a `coord_3d` string.
 
+`coord_3d` contains at least three ordered `x y z` rows. The server closes the
+polygon by connecting the final point back to the first point, searches
+deterministic generic projection directions, and converts the selected diagram
+to PD notation before starting invariant lookup. Brackets, commas, and
+semicolons are accepted as separators. An optional leading point count is also
+accepted when it matches the number of following rows.
+See the [3D Coordinate Manual](coordinates.md) for a complete trefoil sample.
+
 `/api/index_knot_name` resolves standard prime names such as `K11n185`, mirror
 names such as `mK7a7`, and comma-separated connected sums such as
 `K3a1,mK5a2`. It then runs the same invariant and candidate lookup pipeline as
@@ -29,7 +37,9 @@ GET  /api/pd_code2knot_name/<base64-pd-code>
 POST /api/coord_3d2pd_code
 ```
 
-`/api/coord_3d2pd_code` accepts JSON with a `coord_3d` string.
+`/api/coord_3d2pd_code` accepts the same JSON and returns only the generated PD
+code. Invalid numbers, incomplete rows, endpoint crossings, overlapping
+projected segments, and other non-generic projections return a JSON error.
 `/api/knot_name2pd_code` performs only the pure C++ name-to-PD conversion and
 returns the resulting PD code without computing invariants.
 

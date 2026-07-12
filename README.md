@@ -7,6 +7,12 @@ calculation path uses the pure C++ implementation from
 
 Knot Genus and Knot Volume are intentionally not present in this version.
 
+The server supports lookup by knot name or PD code and converts ordered 3D
+polygon coordinates to PD notation with its built-in C++ projection engine.
+The web interface is responsive on desktop and narrow mobile screens, including
+stacked input controls, readable long invariants, card-style task history, and
+two-finger pinch zoom in the PD diagram viewer.
+
 ## Quick Start
 
 Build from the repository root:
@@ -76,6 +82,7 @@ On Windows, replace `build/knot_indexer_lab_server` with
 - [Runtime Data Manual](docs/runtime-data.md): upstream text data layout.
 - [Algorithm Manual](docs/algorithm.md): lookup pipeline, SVG diagram generation, timeout model, name canonicalization, task recovery, and third-party code.
 - [API Manual](docs/api.md): HTTP endpoints, WebSocket updates, and response shapes.
+- [3D Coordinate Manual](docs/coordinates.md): coordinate format, trefoil sample, projection behavior, and API usage.
 
 ## Citation
 

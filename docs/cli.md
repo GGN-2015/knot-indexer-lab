@@ -120,6 +120,17 @@ SVG CLI options:
 The SVG renderer uses only the PD-code diagram layout path. It does not compute
 HOMFLY-PT, Khovanov homology, candidate names, or simplification.
 
+## Web 3D Coordinate Input
+
+The server UI and HTTP API accept an ordered closed polygon as `x y z` rows.
+At least three points are required; the closing edge is added automatically.
+For example, a 12-point polygonal sample of the standard torus-knot
+parameterization can be submitted directly in the 3D Coordinates panel. The
+server performs projection and PD conversion in C++ before running the normal
+invariant pipeline. See the API and algorithm manuals for accepted separators
+and projection rejection rules, or use the complete sample in the
+[3D Coordinate Manual](coordinates.md).
+
 ## Runtime Data
 
 The runtime data folder uses the upstream text layout:

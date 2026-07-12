@@ -36,6 +36,13 @@ export default {
       diagramViewerDragStartY: 0,
       diagramViewerStartX: 0,
       diagramViewerStartY: 0,
+      diagramViewerPointers: {},
+      diagramViewerPinchStartDistance: 0,
+      diagramViewerPinchStartZoom: 1,
+      diagramViewerPinchStartCenterX: 0,
+      diagramViewerPinchStartCenterY: 0,
+      diagramViewerPinchStartTranslateX: 0,
+      diagramViewerPinchStartTranslateY: 0,
       homflypt_polynomial: "...",
       khovanov_homology: "...",
       taskSocket: null,
@@ -433,12 +440,16 @@ export default {
       this.diagramViewerTranslateX = 0;
       this.diagramViewerTranslateY = 0;
       this.diagramViewerDragging = false;
+      this.diagramViewerPointers = {};
+      this.diagramViewerPinchStartDistance = 0;
       this.lockPageScroll();
     },
     closeDiagramViewer() {
       if (!this.diagramViewerOpen) return;
       this.diagramViewerOpen = false;
       this.diagramViewerDragging = false;
+      this.diagramViewerPointers = {};
+      this.diagramViewerPinchStartDistance = 0;
       this.unlockPageScroll();
     },
     handleDiagramViewerKeydown(event) {
@@ -452,10 +463,28 @@ export default {
       this.diagramViewerZoom = 1;
       this.diagramViewerTranslateX = 0;
       this.diagramViewerTranslateY = 0;
+      this.diagramViewerPointers = {};
+      this.diagramViewerDragging = false;
+      this.diagramViewerPinchStartDistance = 0;
     },
     zoomDiagramViewer(delta) {
       const nextZoom = Math.min(8, Math.max(0.25, this.diagramViewerZoom * delta));
       this.diagramViewerZoom = Number(nextZoom.toFixed(3));
+    },
+    diagramViewerPointerValues() {
+      return Object.values(this.diagramViewerPointers);
+    },
+    beginDiagramPinch() {
+      const pointers = this.diagramViewerPointerValues();
+      if (pointers.length < 2) return;
+      const first = pointers[0];
+      const second = pointers[1];
+      this.diagramViewerPinchStartDistance = Math.hypot(second.x - first.x, second.y - first.y);
+      this.diagramViewerPinchStartZoom = this.diagramViewerZoom;
+      this.diagramViewerPinchStartCenterX = (first.x + second.x) / 2;
+      this.diagramViewerPinchStartCenterY = (first.y + second.y) / 2;
+      this.diagramViewerPinchStartTranslateX = this.diagramViewerTranslateX;
+      this.diagramViewerPinchStartTranslateY = this.diagramViewerTranslateY;
     },
     diagramDownloadFileName() {
       const firstName = (this.knot_name_list || "")
@@ -485,22 +514,44 @@ export default {
     },
     startDiagramPan(event) {
       if (!this.diagramViewerOpen) return;
+      this.diagramViewerPointers[event.pointerId] = { x: event.clientX, y: event.clientY };
       this.diagramViewerDragging = true;
+      if (event.currentTarget.setPointerCapture) {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      }
+      if (this.diagramViewerPointerValues().length >= 2) {
+        this.beginDiagramPinch();
+        return;
+      }
       this.diagramViewerDragStartX = event.clientX;
       this.diagramViewerDragStartY = event.clientY;
       this.diagramViewerStartX = this.diagramViewerTranslateX;
       this.diagramViewerStartY = this.diagramViewerTranslateY;
-      if (event.currentTarget.setPointerCapture) {
-        event.currentTarget.setPointerCapture(event.pointerId);
-      }
     },
     moveDiagramPan(event) {
+      if (!this.diagramViewerPointers[event.pointerId]) return;
+      this.diagramViewerPointers[event.pointerId] = { x: event.clientX, y: event.clientY };
+      const pointers = this.diagramViewerPointerValues();
+      if (pointers.length >= 2) {
+        const first = pointers[0];
+        const second = pointers[1];
+        const distance = Math.hypot(second.x - first.x, second.y - first.y);
+        if (this.diagramViewerPinchStartDistance <= 0) this.beginDiagramPinch();
+        const ratio = distance / Math.max(this.diagramViewerPinchStartDistance, 1);
+        const nextZoom = Math.min(8, Math.max(0.25, this.diagramViewerPinchStartZoom * ratio));
+        const centerX = (first.x + second.x) / 2;
+        const centerY = (first.y + second.y) / 2;
+        this.diagramViewerZoom = Number(nextZoom.toFixed(3));
+        this.diagramViewerTranslateX = this.diagramViewerPinchStartTranslateX + centerX - this.diagramViewerPinchStartCenterX;
+        this.diagramViewerTranslateY = this.diagramViewerPinchStartTranslateY + centerY - this.diagramViewerPinchStartCenterY;
+        return;
+      }
       if (!this.diagramViewerDragging) return;
       this.diagramViewerTranslateX = this.diagramViewerStartX + event.clientX - this.diagramViewerDragStartX;
       this.diagramViewerTranslateY = this.diagramViewerStartY + event.clientY - this.diagramViewerDragStartY;
     },
     endDiagramPan(event) {
-      this.diagramViewerDragging = false;
+      delete this.diagramViewerPointers[event.pointerId];
       if (event.currentTarget.releasePointerCapture) {
         try {
           event.currentTarget.releasePointerCapture(event.pointerId);
@@ -508,10 +559,21 @@ export default {
           // The pointer may already be released by the browser.
         }
       }
+      const pointers = this.diagramViewerPointerValues();
+      this.diagramViewerPinchStartDistance = 0;
+      if (pointers.length === 1) {
+        this.diagramViewerDragging = true;
+        this.diagramViewerDragStartX = pointers[0].x;
+        this.diagramViewerDragStartY = pointers[0].y;
+        this.diagramViewerStartX = this.diagramViewerTranslateX;
+        this.diagramViewerStartY = this.diagramViewerTranslateY;
+      } else {
+        this.diagramViewerDragging = false;
+      }
     },
   },
   template: `
-    <div class="alert alert-warning d-flex align-items-center" role="alert">
+    <div class="alert alert-warning d-flex align-items-center notice-bar" role="alert">
       <svg class="bi bi-exclamation-triangle text-success" width="32" height="32" fill="currentColor" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
         <path d="M7.938 2.016A.13.13 0 0 1 8.002 2a.13.13 0 0 1 .063.016.15.15 0 0 1 .054.057l6.857 11.667c.036.061.038.13.002.192a.2.2 0 0 1-.169.068H1.195a.2.2 0 0 1-.17-.068.18.18 0 0 1 .003-.192L7.884 2.073a.15.15 0 0 1 .054-.057m1.044-.45a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767z"/>
         <path d="M7.002 12a1 1 0 1 1 2 0 1 1 0 0 1-2 0M7.1 5.995a.905.905 0 1 1 1.8 0l-.35 3.507a.552.552 0 0 1-1.1 0z"/>
@@ -521,11 +583,11 @@ export default {
       </div>
     </div>
 
-    <div class="d-flex justify-content-end mb-2">
+    <div class="page-actions">
       <a class="btn btn-outline-info" href="/tasks.html">Task Monitor</a>
     </div>
 
-    <div class="accordion mt-2" id="accordionExample">
+    <div class="accordion indexer-accordion" id="accordionExample">
       <div class="accordion-item">
         <h2 class="accordion-header">
           <button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseOne" aria-expanded="true" aria-controls="collapseOne">
@@ -534,30 +596,19 @@ export default {
         </h2>
         <div id="collapseOne" class="accordion-collapse collapse show" data-bs-parent="#accordionExample">
           <div class="accordion-body">
-            <ul class="list-group">
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_name_1"></p>
-              </li>
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_name_2"></p>
-              </li>
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_name_3"></p>
-              </li>
-              <li class="list-group-item">
-                  <div class="row">
-                      <div class="col-10 col-xs-3">
-                          <div class="input-group">
-                              <span class="input-group-text">Knot Name</span>
-                              <textarea id="knot_name" class="form-control" aria-label="Knot Name" rows="1"></textarea>
-                          </div>
-                      </div>
-                      <div class="col">
-                          <button class="btn btn-outline-success" @click="knotNameSubmit">Submit</button>
-                      </div>
-                  </div>
-              </li>
-            </ul>
+            <p class="input-summary" v-html="desc_for_index_by_name_1"></p>
+            <details class="input-help">
+              <summary>Name format</summary>
+              <p v-html="desc_for_index_by_name_2"></p>
+              <p v-html="desc_for_index_by_name_3"></p>
+            </details>
+            <div class="input-form">
+              <div>
+                <label class="form-label" for="knot_name">Knot Name</label>
+                <textarea id="knot_name" class="form-control" aria-label="Knot Name" rows="1" placeholder="K3a1 or K3a1,mK3a1" spellcheck="false" autocapitalize="none"></textarea>
+              </div>
+              <button class="btn btn-outline-success" @click="knotNameSubmit">Submit</button>
+            </div>
           </div>
         </div>
       </div>
@@ -569,27 +620,18 @@ export default {
         </h2>
         <div id="collapseTwo" class="accordion-collapse collapse" data-bs-parent="#accordionExample">
           <div class="accordion-body">
-            <ul class="list-group">
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_pd_1"></p>
-              </li>
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_pd_2"></p>
-              </li>
-              <li class="list-group-item">
-                  <div class="row">
-                      <div class="col-10 col-xs-3">
-                          <div class="input-group">
-                              <span class="input-group-text">PD Notation</span>
-                              <textarea id="pd_notation_box" class="form-control" aria-label="PD Notation" rows="2"></textarea>
-                          </div>
-                      </div>
-                      <div class="col">
-                          <button class="btn btn-outline-success" @click="pdNotationSubmit">Submit</button>
-                      </div>
-                  </div>
-              </li>
-            </ul>
+            <p class="input-summary" v-html="desc_for_index_by_pd_1"></p>
+            <details class="input-help">
+              <summary>PD format</summary>
+              <p v-html="desc_for_index_by_pd_2"></p>
+            </details>
+            <div class="input-form">
+              <div>
+                <label class="form-label" for="pd_notation_box">PD Notation</label>
+                <textarea id="pd_notation_box" class="form-control" aria-label="PD Notation" rows="3" placeholder="[[1,5,2,4],[3,1,4,6],[5,3,6,2]]" spellcheck="false"></textarea>
+              </div>
+              <button class="btn btn-outline-success" @click="pdNotationSubmit">Submit</button>
+            </div>
           </div>
         </div>
       </div>
@@ -601,34 +643,25 @@ export default {
         </h2>
         <div id="collapseThree" class="accordion-collapse collapse" data-bs-parent="#accordionExample">
           <div class="accordion-body">
-            <ul class="list-group">
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_coord_1"></p>
-              </li>
-              <li class="list-group-item">
-                  <p v-html="desc_for_index_by_coord_2"></p>
-              </li>
-              <li class="list-group-item">
-                  <div class="row">
-                      <div class="col-10 col-xs-3">
-                          <div class="input-group">
-                              <span class="input-group-text">Coord 3D</span>
-                              <textarea id="coord_3d_box" class="form-control" aria-label="Coord 3D" rows="5"></textarea>
-                          </div>
-                      </div>
-                      <div class="col">
-                          <button class="btn btn-outline-success" @click="coord3dSubmit">Submit</button>
-                      </div>
-                  </div>
-              </li>
-            </ul>
+            <p class="input-summary" v-html="desc_for_index_by_coord_2"></p>
+            <details class="input-help">
+              <summary>Coordinate format</summary>
+              <p v-html="desc_for_index_by_coord_1"></p>
+            </details>
+            <div class="input-form">
+              <div>
+                <label class="form-label" for="coord_3d_box">3D Coordinates</label>
+                <textarea id="coord_3d_box" class="form-control" aria-label="Coord 3D" rows="7" placeholder="x y z, one point per line" spellcheck="false"></textarea>
+              </div>
+              <button class="btn btn-outline-success" @click="coord3dSubmit">Submit</button>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
     <div class="row mt-2">
-      <div v-html="knot_name_search_status" class="text-center"></div>
+      <div v-html="knot_name_search_status" class="text-center search-status"></div>
     </div>
 
     <section v-if="knot_pd_diagram_svg || knot_pd_diagram_error" class="pd-diagram-section mt-3">
@@ -661,8 +694,8 @@ export default {
         :class="{ 'is-dragging': diagramViewerDragging }"
         @pointerdown.prevent="startDiagramPan"
         @pointermove.prevent="moveDiagramPan"
-        @pointerup="endDiagramPan"
-        @pointercancel="endDiagramPan"
+        @pointerup.prevent="endDiagramPan"
+        @pointercancel.prevent="endDiagramPan"
         @wheel.prevent="wheelDiagramViewer">
         <div
           class="pd-diagram-viewer-content"
@@ -672,7 +705,7 @@ export default {
       </div>
     </div>
 
-    <table class="table mt-2">
+    <table class="table mt-2 result-table">
       <tbody>
         <tr>
           <th scope="row">Possible Knot Name</th>

@@ -1,0 +1,396 @@
+body {
+    min-width: 0;
+    overflow-x: hidden;
+}
+
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    max-width: calc(100vw - 5.5rem);
+}
+
+.navbar-brand-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.navbar-toggler {
+    min-width: 52px;
+    min-height: 44px;
+}
+
+.offcanvas .btn-close {
+    width: 44px;
+    height: 44px;
+    padding: 0.75rem;
+}
+
+.app-shell {
+    max-width: 1120px;
+    margin-top: 1.5rem;
+    padding-bottom: 2rem;
+}
+
+.notice-bar svg {
+    flex: 0 0 auto;
+}
+
+.page-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.75rem;
+}
+
+.indexer-accordion .accordion-body {
+    padding: 1rem;
+}
+
+.input-summary {
+    margin: 0 0 0.75rem;
+}
+
+.input-help {
+    margin-bottom: 1rem;
+    color: var(--bs-secondary-color);
+}
+
+.input-help summary {
+    width: fit-content;
+    color: var(--bs-info-text-emphasis);
+    cursor: pointer;
+}
+
+.input-help p {
+    margin: 0.75rem 0 0;
+}
+
+.input-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 0.75rem;
+}
+
+.input-form textarea {
+    min-height: 44px;
+    font-size: 1rem;
+    resize: vertical;
+}
+
+.input-form .btn {
+    min-width: 7rem;
+    min-height: 44px;
+}
+
+.search-status .alert {
+    margin-bottom: 0;
+}
+
+.result-table {
+    table-layout: fixed;
+}
+
+.result-table th {
+    width: 15rem;
+}
+
+.result-table code,
+.task-cell {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.pd-diagram-section {
+    margin-bottom: 1rem;
+}
+
+.pd-diagram-panel {
+    min-height: 180px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    padding: 0.75rem;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    background: #fff;
+    cursor: zoom-in;
+}
+
+.pd-diagram-panel svg {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: min(58vh, 620px);
+    margin: 0 auto;
+}
+
+.pd-diagram-viewer {
+    position: fixed;
+    inset: 0;
+    z-index: 1080;
+    display: flex;
+    flex-direction: column;
+    padding: 1rem;
+    background: rgba(0, 0, 0, 0.72);
+}
+
+.pd-diagram-viewer-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+
+.pd-diagram-viewer-zoom {
+    min-width: 4rem;
+    color: #fff;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+.pd-diagram-viewer-stage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.42);
+    cursor: grab;
+    touch-action: none;
+}
+
+.pd-diagram-viewer-stage.is-dragging {
+    cursor: grabbing;
+}
+
+.pd-diagram-viewer-content {
+    transform-origin: center center;
+    transition: transform 80ms ease-out;
+    will-change: transform;
+}
+
+.pd-diagram-viewer-stage.is-dragging .pd-diagram-viewer-content {
+    transition: none;
+}
+
+.pd-diagram-viewer-content svg {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: min(88vw, 1200px);
+    max-height: calc(100vh - 8rem);
+    background: #fff;
+}
+
+.task-page-header,
+.task-section-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.task-cell {
+    max-width: 32rem;
+    max-height: 9rem;
+    overflow: auto;
+}
+
+@media (max-width: 767.98px) {
+    .app-shell {
+        width: 100%;
+        margin-top: 0.75rem;
+        padding-right: 0.75rem;
+        padding-left: 0.75rem;
+    }
+
+    .notice-bar {
+        align-items: flex-start !important;
+        padding: 0.75rem;
+    }
+
+    .notice-bar svg {
+        width: 24px;
+        height: 24px;
+        margin-top: 0.125rem;
+    }
+
+    .page-actions .btn {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    .indexer-accordion .accordion-button {
+        min-height: 48px;
+        padding: 0.75rem;
+    }
+
+    .indexer-accordion .accordion-body {
+        padding: 0.75rem;
+    }
+
+    .input-summary,
+    .input-help {
+        font-size: 0.925rem;
+    }
+
+    .input-form {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 0.625rem;
+    }
+
+    .input-form .btn {
+        width: 100%;
+    }
+
+    .result-table,
+    .result-table tbody,
+    .result-table tr,
+    .result-table th,
+    .result-table td {
+        display: block;
+        width: 100%;
+    }
+
+    .result-table {
+        margin-top: 0.75rem !important;
+    }
+
+    .result-table tr {
+        padding: 0.75rem 0;
+        border-bottom: 1px solid var(--bs-border-color);
+    }
+
+    .result-table th,
+    .result-table td {
+        border: 0;
+    }
+
+    .result-table th {
+        padding: 0 0 0.25rem;
+        color: var(--bs-secondary-color);
+        font-size: 0.825rem;
+    }
+
+    .result-table td {
+        padding: 0;
+    }
+
+    .result-table code {
+        display: block;
+        font-size: 0.875rem;
+        line-height: 1.45;
+    }
+
+    .pd-diagram-panel {
+        min-height: 150px;
+        padding: 0.5rem;
+    }
+
+    .pd-diagram-panel svg {
+        max-height: 50vh;
+    }
+
+    .pd-diagram-viewer {
+        padding: 0.5rem;
+    }
+
+    .pd-diagram-viewer-toolbar {
+        justify-content: center;
+        gap: 0.35rem;
+        margin-bottom: 0.5rem;
+    }
+
+    .pd-diagram-viewer-toolbar .btn {
+        min-height: 44px;
+    }
+
+    .pd-diagram-viewer-zoom {
+        min-width: 3.25rem;
+    }
+
+    .pd-diagram-viewer-content svg {
+        max-width: 94vw;
+        max-height: calc(100vh - 8.5rem);
+    }
+
+    .task-page-header {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .task-page-header > .btn {
+        width: 100%;
+        min-height: 44px;
+    }
+
+    .task-section-header .btn {
+        min-height: 44px;
+    }
+
+    .task-table thead {
+        display: none;
+    }
+
+    .task-table,
+    .task-table tbody,
+    .task-table tr,
+    .task-table td {
+        display: block;
+        width: 100%;
+    }
+
+    .task-table tr {
+        margin-bottom: 0.75rem;
+        padding: 0.75rem;
+        border: 1px solid var(--bs-border-color);
+        border-radius: 8px;
+    }
+
+    .task-table td {
+        display: grid;
+        grid-template-columns: 6.75rem minmax(0, 1fr);
+        gap: 0.5rem;
+        padding: 0.4rem 0;
+        border: 0;
+    }
+
+    .task-table td::before {
+        content: attr(data-label);
+        color: var(--bs-secondary-color);
+        font-size: 0.8rem;
+        font-weight: 600;
+    }
+
+    .task-cell {
+        width: 100%;
+        max-width: none;
+        max-height: 8rem;
+    }
+
+    .task-table td .btn {
+        width: 100%;
+        min-height: 44px;
+    }
+}
+
+@media (max-width: 380px) {
+    .navbar-brand {
+        font-size: 1rem;
+    }
+
+    .task-table td {
+        grid-template-columns: 1fr;
+        gap: 0.2rem;
+    }
+}

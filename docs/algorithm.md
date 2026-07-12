@@ -18,6 +18,22 @@ The site supports:
 
 Knot Genus and Knot Volume are intentionally not computed.
 
+## 3D Coordinates To PD Code
+
+The 3D input is an ordered polygonal knot with one finite `x y z` point per
+row. The closing segment from the last point to the first is implicit. The
+pure C++ projection engine tests deterministic view directions, rejects
+non-generic projections, and normally chooses a valid diagram with the fewest
+crossings. It then sorts crossing events along the oriented polygon and emits
+the four incident arc labels for each crossing.
+
+The projection is rejected when a crossing lands on a segment endpoint, two
+projected segments overlap, over/under heights tie, or multiple crossings
+occupy one projected point. A no-crossing polygon produces `[]`, representing
+the unknot in the server pipeline.
+The [3D Coordinate Manual](coordinates.md) includes a tested trefoil polygon
+and direct/full HTTP request details.
+
 ## Invariant Pipeline
 
 Each PD computation request runs isolated worker processes for HOMFLY-PT and
@@ -85,6 +101,11 @@ Each crossing also renders the four adjacent arc numbers around the crossing.
 The labels are taken directly from the neighboring positive matrix cells: top,
 right, bottom, and left. Labels are drawn last with a white stroke behind the
 red text so they remain readable over strands.
+
+On touch screens, opening the diagram viewer enables one-finger panning and
+two-finger pinch zoom. Moving the pinch center pans while the distance between
+the two pointers controls zoom from 25% through 800%. Desktop wheel zoom and
+the viewer toolbar use the same bounds.
 
 ## Name Canonicalization
 

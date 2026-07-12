@@ -28,9 +28,9 @@ By default an isolated no-crossing component contributes no PD crossing, so an
 unknot returns `[]`. Set `Options::encode_isolated_components` to reproduce the
 upstream-style degenerate component encoding.
 
-This module is intentionally not linked into the main knot indexer executable
-yet. Include `link_pd_code.hpp` directly to use the header-only implementation.
-`link_pd_code.cpp` contains the standalone command line interface.
+`knot-indexer-lab` includes this header-only module directly in its server and
+uses it for both direct 3D-to-PD conversion and the full invariant lookup
+pipeline. `link_pd_code.cpp` also contains a standalone command line interface.
 
 Build it with:
 

@@ -122,7 +122,7 @@ export default {
     }
   },
   template: `
-    <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="task-page-header mb-3">
       <div class="d-flex align-items-center gap-2">
         <h1 class="h4 mb-0">Task Monitor</h1>
         <span class="badge" :class="socketStatus === 'live' ? 'text-bg-success' : 'text-bg-secondary'">{{ socketStatus }}</span>
@@ -133,13 +133,13 @@ export default {
     <div v-if="error" class="alert alert-danger" role="alert">{{ error }}</div>
 
     <section class="mb-4">
-      <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="task-section-header mb-2">
         <h2 class="h5 mb-0">Running Tasks</h2>
         <button class="btn btn-outline-info btn-sm" @click="fetchTasks">Refresh</button>
       </div>
       <div v-if="runningTasks.length === 0" class="alert alert-secondary">No running tasks.</div>
       <div v-else class="table-responsive">
-        <table class="table table-sm align-middle">
+        <table class="table table-sm align-middle task-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -153,13 +153,13 @@ export default {
           </thead>
           <tbody>
             <tr v-for="task in runningTasks" :key="task.id">
-              <td>{{ task.id }}</td>
-              <td><span class="badge" :class="statusClass(task.status)">{{ task.status }}</span></td>
-              <td>{{ task.input_type }}</td>
-              <td><pre class="mb-0 small task-cell">{{ task.input }}</pre></td>
-              <td>{{ task.started_at }}</td>
-              <td><pre class="mb-0 small task-cell">{{ task.canonical_pd }}</pre></td>
-              <td>
+              <td data-label="ID">{{ task.id }}</td>
+              <td data-label="Status"><span class="badge" :class="statusClass(task.status)">{{ task.status }}</span></td>
+              <td data-label="Input Type">{{ task.input_type }}</td>
+              <td data-label="Input"><pre class="mb-0 small task-cell">{{ task.input }}</pre></td>
+              <td data-label="Started At">{{ task.started_at }}</td>
+              <td data-label="PD Notation"><pre class="mb-0 small task-cell">{{ task.canonical_pd }}</pre></td>
+              <td data-label="Action">
                 <button class="btn btn-outline-danger btn-sm" :disabled="task.cancel_requested" @click="cancelTask(task.id)">
                   Terminate
                 </button>
@@ -174,7 +174,7 @@ export default {
       <h2 class="h5 mb-2">Completed Tasks</h2>
       <div v-if="finishedTasks.length === 0" class="alert alert-secondary">No completed tasks.</div>
       <div v-else class="table-responsive">
-        <table class="table table-sm align-middle">
+        <table class="table table-sm align-middle task-table">
           <thead>
             <tr>
               <th>ID</th>
@@ -190,18 +190,18 @@ export default {
           </thead>
           <tbody>
             <tr v-for="task in finishedTasks" :key="task.id">
-              <td>{{ task.id }}</td>
-              <td><span class="badge" :class="statusClass(task.status)">{{ task.status }}</span></td>
-              <td>{{ task.input_type }}</td>
-              <td><pre class="mb-0 small task-cell">{{ task.input }}</pre></td>
-              <td>{{ task.started_at }}</td>
-              <td>{{ task.ended_at }}</td>
-              <td><pre class="mb-0 small task-cell">{{ task.knot_types || task.error }}</pre></td>
-              <td>
+              <td data-label="ID">{{ task.id }}</td>
+              <td data-label="Status"><span class="badge" :class="statusClass(task.status)">{{ task.status }}</span></td>
+              <td data-label="Input Type">{{ task.input_type }}</td>
+              <td data-label="Input"><pre class="mb-0 small task-cell">{{ task.input }}</pre></td>
+              <td data-label="Started At">{{ task.started_at }}</td>
+              <td data-label="Ended At">{{ task.ended_at }}</td>
+              <td data-label="Knot Types"><pre class="mb-0 small task-cell">{{ task.knot_types || task.error }}</pre></td>
+              <td data-label="HOMFLY-PT">
                 <span class="badge mb-1" :class="statusClass(task.homfly_status)">{{ task.homfly_status }}</span>
                 <pre class="mb-0 small task-cell">{{ resultText(task.homfly_status, task.homfly_result, task.homfly_error) }}</pre>
               </td>
-              <td>
+              <td data-label="Khovanov">
                 <span class="badge mb-1" :class="statusClass(task.khovanov_status)">{{ task.khovanov_status }}</span>
                 <pre class="mb-0 small task-cell">{{ resultText(task.khovanov_status, task.khovanov_result, task.khovanov_error) }}</pre>
               </td>
