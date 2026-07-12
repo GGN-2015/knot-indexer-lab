@@ -27,6 +27,15 @@ export default {
       knot_pd_code: "...",
       knot_pd_diagram_svg: "",
       knot_pd_diagram_error: "",
+      diagramViewerOpen: false,
+      diagramViewerZoom: 1,
+      diagramViewerTranslateX: 0,
+      diagramViewerTranslateY: 0,
+      diagramViewerDragging: false,
+      diagramViewerDragStartX: 0,
+      diagramViewerDragStartY: 0,
+      diagramViewerStartX: 0,
+      diagramViewerStartY: 0,
       homflypt_polynomial: "...",
       khovanov_homology: "...",
       taskSocket: null,
@@ -36,9 +45,17 @@ export default {
   },
   mounted() {
     this.connectTaskSocket();
+    document.addEventListener("keydown", this.handleDiagramViewerKeydown);
   },
   unmounted() {
+    document.removeEventListener("keydown", this.handleDiagramViewerKeydown);
+    this.unlockPageScroll();
     this.closeTaskSocket();
+  },
+  computed: {
+    diagramViewerTransform() {
+      return `translate(${this.diagramViewerTranslateX}px, ${this.diagramViewerTranslateY}px) scale(${this.diagramViewerZoom})`;
+    }
   },
   methods: {
     replaceAllText(text, from, to) {
@@ -226,6 +243,7 @@ export default {
       this.knot_pd_code = "...";
       this.knot_pd_diagram_svg = "";
       this.knot_pd_diagram_error = "";
+      this.closeDiagramViewer();
       this.homflypt_polynomial = "...";
       this.khovanov_homology = "...";
     },
@@ -397,6 +415,78 @@ export default {
       await navigator.clipboard.writeText(this.khovanov_homology);
       alert("copied");
     },
+    lockPageScroll() {
+      document.body.dataset.previousOverflow = document.body.style.overflow || "";
+      document.body.style.overflow = "hidden";
+    },
+    unlockPageScroll() {
+      if (document.body.dataset.previousOverflow !== undefined) {
+        document.body.style.overflow = document.body.dataset.previousOverflow;
+        delete document.body.dataset.previousOverflow;
+      }
+    },
+    openDiagramViewer() {
+      if (!this.knot_pd_diagram_svg) return;
+      if (this.diagramViewerOpen) return;
+      this.diagramViewerOpen = true;
+      this.diagramViewerZoom = 1;
+      this.diagramViewerTranslateX = 0;
+      this.diagramViewerTranslateY = 0;
+      this.diagramViewerDragging = false;
+      this.lockPageScroll();
+    },
+    closeDiagramViewer() {
+      if (!this.diagramViewerOpen) return;
+      this.diagramViewerOpen = false;
+      this.diagramViewerDragging = false;
+      this.unlockPageScroll();
+    },
+    handleDiagramViewerKeydown(event) {
+      if (!this.diagramViewerOpen) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        this.closeDiagramViewer();
+      }
+    },
+    resetDiagramViewer() {
+      this.diagramViewerZoom = 1;
+      this.diagramViewerTranslateX = 0;
+      this.diagramViewerTranslateY = 0;
+    },
+    zoomDiagramViewer(delta) {
+      const nextZoom = Math.min(8, Math.max(0.25, this.diagramViewerZoom * delta));
+      this.diagramViewerZoom = Number(nextZoom.toFixed(3));
+    },
+    wheelDiagramViewer(event) {
+      const delta = event.deltaY < 0 ? 1.12 : 0.89;
+      this.zoomDiagramViewer(delta);
+    },
+    startDiagramPan(event) {
+      if (!this.diagramViewerOpen) return;
+      this.diagramViewerDragging = true;
+      this.diagramViewerDragStartX = event.clientX;
+      this.diagramViewerDragStartY = event.clientY;
+      this.diagramViewerStartX = this.diagramViewerTranslateX;
+      this.diagramViewerStartY = this.diagramViewerTranslateY;
+      if (event.currentTarget.setPointerCapture) {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      }
+    },
+    moveDiagramPan(event) {
+      if (!this.diagramViewerDragging) return;
+      this.diagramViewerTranslateX = this.diagramViewerStartX + event.clientX - this.diagramViewerDragStartX;
+      this.diagramViewerTranslateY = this.diagramViewerStartY + event.clientY - this.diagramViewerDragStartY;
+    },
+    endDiagramPan(event) {
+      this.diagramViewerDragging = false;
+      if (event.currentTarget.releasePointerCapture) {
+        try {
+          event.currentTarget.releasePointerCapture(event.pointerId);
+        } catch (error) {
+          // The pointer may already be released by the browser.
+        }
+      }
+    },
   },
   template: `
     <div class="alert alert-warning d-flex align-items-center" role="alert">
@@ -521,9 +611,43 @@ export default {
 
     <section v-if="knot_pd_diagram_svg || knot_pd_diagram_error" class="pd-diagram-section mt-3">
       <h2 class="h5">PD Diagram</h2>
-      <div v-if="knot_pd_diagram_svg" class="pd-diagram-panel" v-html="knot_pd_diagram_svg"></div>
+      <div
+        v-if="knot_pd_diagram_svg"
+        class="pd-diagram-panel"
+        role="button"
+        tabindex="0"
+        aria-label="Open PD diagram detail"
+        @click="openDiagramViewer"
+        @keydown.enter.prevent="openDiagramViewer"
+        @keydown.space.prevent="openDiagramViewer"
+        v-html="knot_pd_diagram_svg">
+      </div>
       <div v-if="knot_pd_diagram_error" class="alert alert-warning mt-2 mb-0">{{ knot_pd_diagram_error }}</div>
     </section>
+
+    <div v-if="diagramViewerOpen" class="pd-diagram-viewer" @click.self="closeDiagramViewer">
+      <div class="pd-diagram-viewer-toolbar" @click.stop>
+        <button type="button" class="btn btn-outline-light btn-sm" aria-label="Zoom out" @click="zoomDiagramViewer(0.8)">-</button>
+        <span class="pd-diagram-viewer-zoom">{{ Math.round(diagramViewerZoom * 100) }}%</span>
+        <button type="button" class="btn btn-outline-light btn-sm" aria-label="Zoom in" @click="zoomDiagramViewer(1.25)">+</button>
+        <button type="button" class="btn btn-outline-light btn-sm" @click="resetDiagramViewer">Reset</button>
+        <button type="button" class="btn btn-light btn-sm" @click="closeDiagramViewer">Close</button>
+      </div>
+      <div
+        class="pd-diagram-viewer-stage"
+        :class="{ 'is-dragging': diagramViewerDragging }"
+        @pointerdown.prevent="startDiagramPan"
+        @pointermove.prevent="moveDiagramPan"
+        @pointerup="endDiagramPan"
+        @pointercancel="endDiagramPan"
+        @wheel.prevent="wheelDiagramViewer">
+        <div
+          class="pd-diagram-viewer-content"
+          :style="{ transform: diagramViewerTransform }"
+          v-html="knot_pd_diagram_svg">
+        </div>
+      </div>
+    </div>
 
     <table class="table mt-2">
       <tbody>
