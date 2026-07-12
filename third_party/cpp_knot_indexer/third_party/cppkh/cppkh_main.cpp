@@ -620,7 +620,7 @@ class SmallArena {
         explicit Chunk(size_t n) : data(new unsigned char[n]), capacity(n) {}
     };
 
-    static const size_t defaultChunkSize = 4u * 1024u * 1024u;
+    static constexpr size_t defaultChunkSize = 4u * 1024u * 1024u;
     std::vector<Chunk> chunks;
     size_t chunkIndex = 0;
     size_t offset = 0;
