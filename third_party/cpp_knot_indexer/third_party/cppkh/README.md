@@ -26,22 +26,8 @@ compiler.
 
 Build the fastest executable that the current machine can support:
 
-Windows:
-
-```bat
-package.bat
-```
-
-PowerShell:
-
-```powershell
-.\package.ps1
-```
-
-Linux / macOS / MSYS2:
-
 ```sh
-sh package.sh
+python build.py
 ```
 
 Run one PD code:
@@ -64,15 +50,17 @@ R1-move removal and then nugatory-crossing removal are enabled by default.
 
 ## Performance Snapshot
 
-On the full 8397-case benchmark, both C++ paths matched every bundled JavaKh
-result. `cppkh` finished in `61.596s`, `cppkh-interface` batch API finished in
-`61.392s` after its executable was already cached, and the patched bundled
-JavaKh native multiline runner finished in `466.562s`. That is a `7.575x`
-Java/cppkh speedup and a `7.600x` Java/cppkh-interface speedup.
+On the full 8397-case benchmark, `cppkh` and the patched bundled JavaKh
+matched every result. `cppkh` finished in `64.185s`, `cppkh-interface` batch
+API finished in `65.406s` after its executable was already cached, and the
+patched bundled JavaKh native multiline runner finished in `298.453s`. The
+PyPI `javakh-interface` package was checked on a deterministic random
+100-case sample and averaged `0.586s` per PD code.
 
-Peak RSS on the same prepared full input was `26.04 MiB` for `cppkh`,
-`68.08 MiB` for `cppkh-interface` including Python plus the child executable,
-and `453.57 MiB` for patched JavaKh.
+Peak RSS on the same prepared full input was `26.05 MiB` for `cppkh`,
+`60.23 MiB` for `cppkh-interface` as a Python batch API call, and
+`491.55 MiB` for patched JavaKh. The previous PyPI `javakh-interface`
+50-case memory sample peaked at `161.19 MiB`.
 
 ![cppkh benchmark runtime and memory chart](docs/assets/benchmark_runtime_memory.png)
 
@@ -80,22 +68,19 @@ and `453.57 MiB` for patched JavaKh.
 
 Build a shared library instead of an executable:
 
-```bat
-package.bat --shared --name cppkh
-```
-
 ```sh
-sh package.sh --shared --name cppkh
+python build.py --shared --name cppkh
 ```
 
 This produces `cppkh.dll`, `libcppkh.so`, or `libcppkh.dylib`, depending on the
-platform. Any non-system runtime libraries found by the package script are
+platform. Any non-system runtime libraries found by `build.py` are
 copied beside it.
 
 ## Documentation
 
 - [Build and packaging options](docs/BUILD_AND_PACKAGING.md)
 - [Command-line options](docs/CLI_OPTIONS.md)
+- [Algorithm notes](docs/ALGORITHM.md)
 - [Python ctypes interface](docs/PYTHON_CTYPES.md)
 - [cppkh-interface Python package](docs/PYTHON_PACKAGE.md)
 - [Testing against JavaKh](docs/TEST.md)

@@ -2760,6 +2760,9 @@ std::string Komplex::KhForZ() {
 
 static int chooseXingRecursive(const std::vector<int>& edges, const std::vector<std::vector<int> >& pd,
                                std::vector<char>& in, std::vector<char>& done, int depth, std::vector<int>& retmax) {
+    // Choose the next crossing for the growing tangle. The heuristic maximizes
+    // already-attached boundary arcs, with a short lookahead to keep later
+    // intermediate girth smaller. It affects runtime, not the homology result.
     int nedges = static_cast<int>(edges.size());
     int best = -1, nconbest = -1;
     std::vector<int> rbest(depth, 0);
@@ -2820,11 +2823,87 @@ static int takeNextCrossing(const std::vector<int>&, const std::vector<std::vect
 }
 
 static std::vector<int> getSigns(const std::vector<std::vector<int> >& pd) {
+    const int nodeCount = static_cast<int>(pd.size() * 4);
+    if (nodeCount == 0) return std::vector<int>();
+
+    int maxLabel = -1;
+    for (size_t i = 0; i < pd.size(); ++i) {
+        if (pd[i].size() != 4) throw std::runtime_error("PD crossing must have four entries");
+        for (int label : pd[i]) {
+            if (label < 0) throw std::runtime_error("PD arc labels must be positive");
+            maxLabel = std::max(maxLabel, label);
+        }
+    }
+
+    std::vector<int> first(maxLabel + 1, -1), second(maxLabel + 1, -1);
+    for (size_t i = 0; i < pd.size(); ++i) {
+        for (int slot = 0; slot < 4; ++slot) {
+            int label = pd[i][slot];
+            int node = static_cast<int>(4 * i) + slot;
+            if (first[label] == -1) first[label] = node;
+            else if (second[label] == -1) second[label] = node;
+            else throw std::runtime_error("PD arc label appears more than twice");
+        }
+    }
+
+    std::vector<int> other(nodeCount, -1);
+    for (int label = 0; label <= maxLabel; ++label) {
+        if (first[label] == -1) continue;
+        if (second[label] == -1) throw std::runtime_error("PD arc label does not appear twice");
+        other[first[label]] = second[label];
+        other[second[label]] = first[label];
+    }
+
+    // 1 means that this edge leaves the crossing at this incidence, and 0
+    // means that it enters. Opposite incidences at a crossing and the two
+    // incidences of one edge always have opposite directions.
+    std::vector<signed char> outgoing(nodeCount, -1);
+    std::vector<int> queue;
+    queue.reserve(nodeCount);
+    auto orientComponent = [&](int seed, signed char direction) {
+        if (outgoing[seed] != -1) {
+            if (outgoing[seed] != direction) throw std::runtime_error("inconsistent PD orientation");
+            return;
+        }
+        queue.clear();
+        outgoing[seed] = direction;
+        queue.push_back(seed);
+        for (size_t head = 0; head < queue.size(); ++head) {
+            int node = queue[head];
+            int crossing = node / 4;
+            int slot = node % 4;
+            int neighbors[2] = {4 * crossing + ((slot + 2) % 4), other[node]};
+            for (int next : neighbors) {
+                if (next < 0) throw std::runtime_error("broken PD edge incidence");
+                signed char nextDirection = static_cast<signed char>(1 - outgoing[node]);
+                if (outgoing[next] == -1) {
+                    outgoing[next] = nextDirection;
+                    queue.push_back(next);
+                } else if (outgoing[next] != nextDirection) {
+                    throw std::runtime_error("inconsistent PD orientation");
+                }
+            }
+        }
+    };
+
+    // In SageMath's PD convention slot 0 is the incoming under-edge and slot
+    // 2 is the outgoing under-edge. These seeds orient every component that
+    // passes under at least once.
+    for (size_t i = 0; i < pd.size(); ++i) orientComponent(static_cast<int>(4 * i + 2), 1);
+
+    // A component which is over at every crossing has no orientation encoded
+    // by the PD tuples. Match SageMath's deterministic traversal by taking the
+    // first occurrence of the smallest still-unoriented edge as a tail.
+    for (int label = 0; label <= maxLabel; ++label) {
+        if (first[label] != -1 && outgoing[first[label]] == -1) orientComponent(first[label], 1);
+    }
+
     std::vector<int> xsigns(pd.size());
     for (size_t i = 0; i < pd.size(); ++i) {
-        if (pd[i][1] - pd[i][3] == 1 || pd[i][3] - pd[i][1] > 1) xsigns[i] = 1;
-        else if (pd[i][3] - pd[i][1] == 1 || pd[i][1] - pd[i][3] > 1) xsigns[i] = -1;
-        else throw std::runtime_error("error finding crossing signs");
+        const std::vector<int>& crossing = pd[i];
+        if (crossing[0] == crossing[3] || crossing[2] == crossing[1]) xsigns[i] = -1;
+        else if (crossing[3] == crossing[2] || crossing[0] == crossing[1]) xsigns[i] = 1;
+        else xsigns[i] = outgoing[4 * i + 3] ? -1 : 1;
     }
     return xsigns;
 }
@@ -2910,8 +2989,9 @@ static PDCode renumberR1Order(PDCode pd) {
     return pd;
 }
 
-static PDCode eraseR1(PDCode pd) {
+static PDCode eraseR1(PDCode pd, std::vector<int>* signs) {
     if (!sanityPD(pd)) throw std::runtime_error("invalid PD code: every arc label must appear exactly twice");
+    if (signs && signs->size() != pd.size()) throw std::runtime_error("crossing sign count does not match PD code");
     bool hasR1 = true;
     while (hasR1) {
         hasR1 = false;
@@ -2919,6 +2999,7 @@ static PDCode eraseR1(PDCode pd) {
             if (uniqueCount(pd[i]) <= 3) {
                 std::vector<int> crossing = pd[i];
                 pd.erase(pd.begin() + static_cast<std::ptrdiff_t>(i));
+                if (signs) signs->erase(signs->begin() + static_cast<std::ptrdiff_t>(i));
                 std::vector<int> singles;
                 for (int v : crossing) {
                     if (std::count(crossing.begin(), crossing.end(), v) == 1) singles.push_back(v);
@@ -3073,8 +3154,9 @@ static PDCode renumberFullDfs(PDCode pd) {
     return pd;
 }
 
-static PDCode eraseOneNugatory(PDCode pd, size_t index) {
+static PDCode eraseOneNugatory(PDCode pd, size_t index, std::vector<int>* signs) {
     if (uniqueCount(pd[index]) != 4) throw std::runtime_error("nugatory erase requires R1-free PD code");
+    if (signs && signs->size() != pd.size()) throw std::runtime_error("crossing sign count does not match PD code");
     int ax = pd[index][0];
     int bx = pd[index][1];
     int cx = pd[index][2];
@@ -3098,17 +3180,18 @@ static PDCode eraseOneNugatory(PDCode pd, size_t index) {
     }
     PDCode bad = pd;
     bad.erase(bad.begin() + static_cast<std::ptrdiff_t>(index));
+    if (signs) signs->erase(signs->begin() + static_cast<std::ptrdiff_t>(index));
     bad = replaceArcValue(bad, ax, cx);
     bad = replaceArcValue(bad, dx, bx);
     return renumberFullDfs(bad);
 }
 
-static PDCode simplifyPDCode(PDCode pd) {
-    pd = eraseR1(pd);
+static PDCode simplifyPDCode(PDCode pd, std::vector<int>* signs = nullptr) {
+    pd = eraseR1(pd, signs);
     while (true) {
         int index = findNugatory(pd);
         if (index < 0) break;
-        pd = eraseOneNugatory(pd, static_cast<size_t>(index));
+        pd = eraseOneNugatory(pd, static_cast<size_t>(index), signs);
     }
     return pd;
 }
@@ -3132,6 +3215,8 @@ static Komplex generateFast(const std::vector<std::vector<int> >& pd, const std:
     std::vector<std::vector<int> > pd1(1, std::vector<int>{0,1,2,3});
     Komplex kplus(pd1, std::vector<int>{1}, 4);
     Komplex kminus(pd1, std::vector<int>{-1}, 4);
+    // Build the full complex by composing one crossing complex at a time and
+    // reducing after every composition, following JavaKh's tangle-growth path.
     std::vector<int> edges;
     int firstdepth = pd.size() > 4 ? 3 : static_cast<int>(pd.size()) - 1;
     std::vector<int> firstdummy(firstdepth + 1, 0);
@@ -3315,8 +3400,9 @@ static std::vector<std::string> listInputFiles(const std::string& dir) {
 static std::string computePD(const std::vector<std::vector<int> >& pd) {
     flushCobCache();
     g_smallArena.reset();
-    PDCode working = g_options.simplifyPD ? simplifyPDCode(pd) : pd;
-    Komplex k = generateFast(working, getSigns(working));
+    std::vector<int> signs = getSigns(pd);
+    PDCode working = g_options.simplifyPD ? simplifyPDCode(pd, &signs) : pd;
+    Komplex k = generateFast(working, signs);
     ProfileScope khScope(g_profile.kh);
     return k.KhForZ();
 }
@@ -3332,6 +3418,18 @@ static std::string formatPDCode(const PDCode& pd) {
             out << (pd[i][j] + 1);
         }
         out << "]";
+    }
+    out << "]";
+    return out.str();
+}
+
+static std::string formatCrossingSigns(const PDCode& pd) {
+    std::vector<int> signs = getSigns(pd);
+    std::ostringstream out;
+    out << "[";
+    for (size_t i = 0; i < signs.size(); ++i) {
+        if (i) out << ",";
+        out << signs[i];
     }
     out << "]";
     return out.str();
@@ -3464,7 +3562,7 @@ CPPKH_API char* cppkh_simplify_pd(const char* pd_code) {
 
 #ifndef CPPKH_SHARED_LIBRARY
 static void usage() {
-    std::cout << "Usage: cppkh [--pd-file FILE] [--pd-dir DIR] [--pd-code CODE] [--ordered] [--threads N|auto] [--quiet] [--profile] [--no-simplify-pd] [--print-simplified-pd]\n";
+    std::cout << "Usage: cppkh [--pd-file FILE] [--pd-dir DIR] [--pd-code CODE] [--ordered] [--threads N|auto] [--quiet] [--profile] [--no-simplify-pd] [--print-simplified-pd] [--print-crossing-signs]\n";
     std::cout << "Thread backend: " << KH_THREAD_BACKEND_NAME << "\n";
     std::cout << "Detected CPU threads: " << kh::detectHardwareThreads() << "\n";
     std::cout << "PD simplification: R1 removal then nugatory crossing removal is enabled by default.\n";
@@ -3475,6 +3573,7 @@ int main(int argc, char** argv) {
         std::vector<std::string> files;
         std::vector<std::pair<std::string, std::vector<std::vector<int> > > > jobs;
         bool printSimplifiedPD = false;
+        bool printCrossingSigns = false;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--help" || a == "-h") { usage(); return 0; }
@@ -3495,6 +3594,7 @@ int main(int argc, char** argv) {
             else if (a == "--no-simplify-pd" || a == "--raw-pd") kh::g_options.simplifyPD = false;
             else if (a == "--simplify-pd") kh::g_options.simplifyPD = true;
             else if (a == "--print-simplified-pd") printSimplifiedPD = true;
+            else if (a == "--print-crossing-signs") printCrossingSigns = true;
             else if (a == "--threads" || a == "-j") {
                 if (++i >= argc) throw std::runtime_error("--threads needs a number");
                 std::string v = argv[i];
@@ -3523,6 +3623,7 @@ int main(int argc, char** argv) {
             }
             if (label) std::cout << jobs[i].first << "\t";
             if (printSimplifiedPD) std::cout << kh::simplifiedPDString(jobs[i].second) << "\n";
+            else if (printCrossingSigns) std::cout << kh::formatCrossingSigns(jobs[i].second) << "\n";
             else std::cout << "\"" << kh::computePD(jobs[i].second) << "\"\n";
             if (kh::g_options.profile) {
                 kh::g_profile.totalNs = kh::profileNowNs() - profileStart;
