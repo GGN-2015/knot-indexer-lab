@@ -15,6 +15,20 @@ Brackets, commas, and semicolons are accepted as separators, so a copied list
 such as `[0,0,0]; [1,0,0]; [0,1,0]` is also valid. An optional leading point
 count is accepted when it equals the number of following rows.
 
+## CHE/LAMMPS Molecule Files
+
+The same API fields also accept a LAMMPS-style molecule data file containing
+`Atoms` and `Bonds` sections. The pure C++ CHE parser validates that the bond
+graph is one closed, non-branching cycle and orders coordinates by that graph;
+atom rows therefore do not need to be sorted by atom ID. Common LAMMPS atom
+layouts with `id`, molecule/type fields, `x y z`, and optional image flags are
+accepted.
+
+This format is used by the
+[`hybrid_knot_indexer` test dataset](testing.md#hybrid_knot_indexer-dataset).
+Open chains, branches, missing atom references, duplicate bonds, and multiple
+components are rejected with a descriptive error.
+
 ## Trefoil Example
 
 This 12-point polygon is a sampled `(2,3)` torus knot:

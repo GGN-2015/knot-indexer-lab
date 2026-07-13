@@ -45,6 +45,16 @@ Run the integration tests:
 python test.py --rebuild
 ```
 
+Run the 22 coordinate cases from `hybrid_knot_indexer`:
+
+```sh
+python tests/hybrid_knot_indexer.py --rebuild
+```
+
+The first run downloads and caches the pinned upstream test data. See the
+[Testing Manual](docs/testing.md) for local-dataset, selected-case, remote
+server, timeout, and JSON report options.
+
 Open Task Monitor from the navigation bar. The lookup interface and task
 monitor are two views of the same root page, so the browser URL remains `/`.
 
@@ -92,6 +102,7 @@ On Windows, replace `build/knot_indexer_lab_server` with
 - [Algorithm Manual](docs/algorithm.md): lookup pipeline, SVG diagram generation, timeout model, name canonicalization, task recovery, and third-party code.
 - [API Manual](docs/api.md): HTTP endpoints, WebSocket updates, and response shapes.
 - [3D Coordinate Manual](docs/coordinates.md): coordinate format, trefoil sample, projection behavior, and API usage.
+- [Testing Manual](docs/testing.md): offline integration tests and the `hybrid_knot_indexer` coordinate dataset runner.
 
 ## Citation
 

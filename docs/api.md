@@ -14,12 +14,14 @@ POST /api/index_coord_3d
 These endpoints create a computation task and return a lookup result object.
 The coordinate endpoint accepts JSON with a `coord_3d` string.
 
-`coord_3d` contains at least three ordered `x y z` rows. The server closes the
-polygon by connecting the final point back to the first point, searches
-deterministic generic projection directions, and converts the selected diagram
-to PD notation before starting invariant lookup. Brackets, commas, and
-semicolons are accepted as separators. An optional leading point count is also
-accepted when it matches the number of following rows.
+`coord_3d` contains either at least three ordered `x y z` rows or a single-loop
+LAMMPS/CHE molecule file with `Atoms` and `Bonds` sections. The server closes
+an ordered polygon by connecting the final point back to the first point. CHE
+input is ordered from its bond graph. The server then searches deterministic
+generic projection directions and converts the selected diagram to PD notation
+before starting invariant lookup. Brackets, commas, and semicolons are accepted
+as ordered-row separators. An optional leading point count is also accepted
+when it matches the number of following rows.
 See the [3D Coordinate Manual](coordinates.md) for a complete trefoil sample.
 
 `/api/index_knot_name` resolves standard prime names such as `K11n185`, mirror

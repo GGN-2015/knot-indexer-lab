@@ -223,6 +223,7 @@ def build_flags(args: argparse.Namespace, cxx: list[str]) -> tuple[list[str], li
 
     flags += [
         "-I", str(ROOT / "src" / "server"),
+        "-I", str(VENDOR / "src" / "che_to_coord"),
         "-I", str(VENDOR / "src" / "common"),
         "-I", str(VENDOR / "src" / "knot_indexer"),
         "-I", str(VENDOR / "src" / "link_pd_code"),

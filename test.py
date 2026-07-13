@@ -23,6 +23,27 @@ ROOT = Path(__file__).resolve().parent
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 DEFAULT_EXE = ROOT / "build" / f"knot_indexer_lab_server{EXE_SUFFIX}"
 TREFOIL = "[[1,5,2,4],[3,1,4,6],[5,3,6,2]]"
+CHE_UNKNOT = """LAMMPS data file
+
+4 atoms
+1 atom types
+4 bonds
+1 bond types
+
+Atoms
+
+1 1 1 0 0 0 0 0 0
+2 1 1 1 0 0 0 0 0
+3 1 1 1 1 0 0 0 0
+4 1 1 0 1 0 0 0 0
+
+Bonds
+
+1 1 1 2
+2 1 2 3
+3 1 3 4
+4 1 4 1
+"""
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -43,6 +64,17 @@ def encode_payload(value: str) -> str:
 
 def request_json(opener: urllib.request.OpenerDirector, url: str) -> dict[str, object]:
     with opener.open(url, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def post_json(opener: urllib.request.OpenerDirector, url: str, payload: dict[str, str]) -> dict[str, object]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with opener.open(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -139,6 +171,13 @@ def run_tests(exe: Path) -> None:
             assert completed["task_id"] == 2, completed
             assert completed["homfly_status"] == "success", completed
             assert completed["khovanov_status"] == "success", completed
+
+            che_result = post_json(
+                opener,
+                base_url + "/api/coord_3d2pd_code",
+                {"coord_3d": CHE_UNKNOT},
+            )
+            assert che_result == {"status": "success", "message": "[]"}, che_result
 
             history_page = request_json(opener, base_url + "/api/tasks/history/0")
             records = history_page["tasks"]

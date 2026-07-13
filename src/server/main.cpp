@@ -11,6 +11,7 @@
 #endif
 
 #include "database.hpp"
+#include "che_to_coord.hpp"
 #include "homfly_backend.hpp"
 #include "khovanov_backend.hpp"
 #include "link_pd_code.hpp"
@@ -2450,6 +2451,20 @@ std::string normalizePdInput(const std::string& raw) {
 }
 
 std::vector<cki::link_pd_code::Point3> parseCoordinateRows(const std::string& raw) {
+    if (raw.find("Atoms") != std::string::npos && raw.find("Bonds") != std::string::npos) {
+        const auto loop = cki::che_to_coord::parseCoordinateLoopText(raw);
+        std::vector<cki::link_pd_code::Point3> points;
+        points.reserve(loop.size());
+        for (const auto& point : loop) {
+            points.push_back(cki::link_pd_code::Point3{
+                point.position.x,
+                point.position.y,
+                point.position.z,
+            });
+        }
+        return points;
+    }
+
     std::string text = raw;
     for (char& c : text) {
         if (c == '[' || c == ']' || c == ';' || c == ',') c = ' ';
