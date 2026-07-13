@@ -28,6 +28,7 @@ UPSTREAM_REVISION = "b959fda15f76ab7bf6eb02571a5dbd237024b65b"
 EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 DEFAULT_SERVER = ROOT / "build" / ("knot_indexer_lab_server" + EXE_SUFFIX)
 DEFAULT_CACHE = ROOT / ".cache" / "hybrid_knot_indexer"
+BUILTIN_DATA = ROOT / "tests" / "data" / "hybrid_knot_indexer" / "che_data"
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 
 
@@ -56,20 +57,26 @@ def parse_args() -> argparse.Namespace:
             "cases through the knot-indexer-lab HTTP API."
         )
     )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
         "--source",
         type=Path,
         help="Local hybrid_knot_indexer checkout, src/che_data directory, or equivalent dataset directory.",
     )
+    source_group.add_argument(
+        "--upstream",
+        action="store_true",
+        help="Download and test an upstream revision instead of using the dataset committed in this repository.",
+    )
     parser.add_argument(
         "--revision",
         default=UPSTREAM_REVISION,
-        help=f"Upstream archive revision used without --source. Default: {UPSTREAM_REVISION}",
+        help=f"Archive revision used with --upstream. Default: {UPSTREAM_REVISION}",
     )
     parser.add_argument(
         "--refresh",
         action="store_true",
-        help="Redownload the selected upstream revision instead of using the cache.",
+        help="Redownload the selected --upstream revision instead of using the cache.",
     )
     parser.add_argument(
         "--server",
@@ -123,6 +130,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-crossing must be between 1 and 16")
     if args.server_url and args.rebuild:
         parser.error("--rebuild cannot be combined with --server-url")
+    if args.refresh and not args.upstream:
+        parser.error("--refresh requires --upstream")
+    if args.revision != UPSTREAM_REVISION and not args.upstream:
+        parser.error("--revision requires --upstream")
     return args
 
 
@@ -350,10 +361,15 @@ def write_report(path: Path, revision: str, data_directory: Path, results: list[
 
 
 def run(args: argparse.Namespace) -> int:
-    data_directory = (
-        locate_data_directory(args.source) if args.source is not None else download_dataset(args.revision, args.refresh)
-    )
-    dataset_revision = local_source_revision(args.source) if args.source is not None else args.revision
+    if args.source is not None:
+        data_directory = locate_data_directory(args.source)
+        dataset_revision = local_source_revision(args.source)
+    elif args.upstream:
+        data_directory = download_dataset(args.revision, args.refresh)
+        dataset_revision = args.revision
+    else:
+        data_directory = locate_data_directory(BUILTIN_DATA)
+        dataset_revision = UPSTREAM_REVISION
     cases = discover_cases(data_directory, args.cases)
     print(f"Dataset: {data_directory}")
     print(f"Revision: {dataset_revision}")

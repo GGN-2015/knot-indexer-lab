@@ -51,9 +51,10 @@ Run the 22 coordinate cases from `hybrid_knot_indexer`:
 python tests/hybrid_knot_indexer.py --rebuild
 ```
 
-The first run downloads and caches the pinned upstream test data. See the
-[Testing Manual](docs/testing.md) for local-dataset, selected-case, remote
-server, timeout, and JSON report options.
+The pinned upstream test data is included in this repository, so this command
+does not require a network connection. See the [Testing Manual](docs/testing.md)
+for local-dataset, selected-case, alternate-upstream, remote-server, timeout,
+and JSON report options.
 
 Open Task Monitor from the navigation bar. The lookup interface and task
 monitor are two views of the same root page, so the browser URL remains `/`.

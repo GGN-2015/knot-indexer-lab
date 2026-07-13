@@ -26,11 +26,12 @@ Run the pinned 22-case dataset with:
 python tests/hybrid_knot_indexer.py --rebuild
 ```
 
-The first run downloads the dataset at commit
-`b959fda15f76ab7bf6eb02571a5dbd237024b65b` into
-`.cache/hybrid_knot_indexer/`. The cache and upstream data are not committed to
-this repository. Later runs reuse the cache and the existing server binary.
-Each case has a maximum computation time of 20 minutes.
+The 22 input files from commit
+`b959fda15f76ab7bf6eb02571a5dbd237024b65b` are committed under
+`tests/data/hybrid_knot_indexer/che_data/`. The default test is therefore
+offline and deterministic. Each case has a maximum computation time of 20
+minutes. Upstream provenance is recorded in
+`tests/data/hybrid_knot_indexer/UPSTREAM.md`.
 
 The expected name is taken from the case directory. A case passes when that
 name is present in the returned candidates; additional candidates are allowed
@@ -62,17 +63,20 @@ Run one or more selected names:
 python tests/hybrid_knot_indexer.py --case K3a1 --case mK8a7
 ```
 
-Refresh a downloaded revision:
+Download and test the pinned upstream revision instead of the built-in copy:
 
 ```sh
-python tests/hybrid_knot_indexer.py --refresh
+python tests/hybrid_knot_indexer.py --upstream
 ```
 
 Test another upstream revision:
 
 ```sh
-python tests/hybrid_knot_indexer.py --revision main --refresh
+python tests/hybrid_knot_indexer.py --upstream --revision main --refresh
 ```
+
+Downloaded revisions are cached below `.cache/hybrid_knot_indexer/` and are
+not committed automatically.
 
 ## Running Server
 
