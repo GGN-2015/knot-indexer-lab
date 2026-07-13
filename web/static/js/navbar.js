@@ -1,13 +1,20 @@
 export default {
+  props: {
+    activeView: {
+      type: String,
+      default: "home"
+    }
+  },
+  emits: ["navigate"],
   data() {
     return {
-      website_title: "",
+      website_title: "knot-indexer-lab",
       author_info: "powered by <code>GGN_2015</code>, from Jilin University, CCST",
       last_build_info: ""
     };
   },
   async mounted() {
-    this.navbarSetTitle(document.title);
+    this.navbarSetTitle(document.title || "knot-indexer-lab");
   },
   methods: {
     navbarSetTitle(title) {
@@ -16,6 +23,9 @@ export default {
     navbarSearch() {
       const searchContent = document.getElementById("search_content").value;
       alert(searchContent);
+    },
+    navigate(view) {
+      this.$emit("navigate", view);
     },
     async getLastBuildInfo() {
       const response = await fetch("/api/last_build_info");
@@ -29,20 +39,20 @@ export default {
   template: `
     <nav class="navbar navbar-expand-lg bg-body-tertiary">
         <div class="container-fluid">
-          <a class="navbar-brand" href="#">
+          <button class="navbar-brand btn border-0 p-0" type="button" @click="navigate('home')">
             <img src="/img/logo.svg" width="30" height="30" class="d-inline-block align-top" alt="">
             <span class="navbar-brand-text">{{ website_title }}</span>
-          </a>
+          </button>
           <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent" aria-expanded="false" aria-label="Toggle navigation">
             <span class="navbar-toggler-icon"></span>
           </button>
           <div class="collapse navbar-collapse" id="navbarSupportedContent">
             <ul class="navbar-nav me-auto mb-2 mb-lg-0">
               <li class="nav-item">
-                <a class="nav-link active" aria-current="page" href="/">Home</a>
+                <button class="nav-link" :class="{ active: activeView === 'home' }" :aria-current="activeView === 'home' ? 'page' : null" type="button" @click="navigate('home')">Home</button>
               </li>
               <li class="nav-item">
-                <a class="nav-link" href="/tasks.html">Task Monitor</a>
+                <button class="nav-link" :class="{ active: activeView === 'tasks' }" :aria-current="activeView === 'tasks' ? 'page' : null" type="button" @click="navigate('tasks')">Task Monitor</button>
               </li>
               <li class="nav-item">
                 <a class="nav-link" href="#" @click="toggleOffcanvas">About Us</a>

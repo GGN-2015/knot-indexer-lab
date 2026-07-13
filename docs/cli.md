@@ -27,6 +27,12 @@ build/knot_indexer_lab_server.exe
 
 The build script also copies `data/` and `web/` beside the executable.
 
+Build and run the server integration tests:
+
+```sh
+python test.py --rebuild
+```
+
 Useful build options:
 
 ```sh
@@ -80,12 +86,28 @@ Server options:
 ```text
 --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0
 --port PORT          TCP port. Default: 5000
---data-folder PATH   Runtime folder containing homfly/, khovanov/, and knotname-reg/
+--data-folder PATH   Runtime folder containing homfly/, khovanov/, knotname-reg/, and name-pd/
 --web-root PATH      Runtime web asset folder
 --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200
 --max-crossing N     Maximum total crossing number. Default: 14, max: 16
+--worker-memory-mb N Maximum memory per compute worker. Default: adaptive, max 4096
+--memory-reserve-mb N Memory kept free for the server and OS. Default: adaptive
+--cache-memory-mb N  In-memory result cache limit. Default: 64, 0 disables
+--task-history PATH  Persistent completed-task history file
 --help, -h           Show help text
 ```
+
+With the adaptive defaults, the server detects physical memory and Linux
+cgroup v1/v2 limits. It reserves the larger of 512 MiB or 20 percent of the
+effective limit, then caps one worker at the remaining currently available
+memory or 4096 MiB, whichever is smaller. At least 128 MiB must be available
+for a worker. Explicit memory values are still reduced when necessary to keep
+the configured server reserve intact.
+
+Computations enter a FIFO queue and the 1200-second timeout includes queue
+waiting and all worker attempts. Only one compute worker runs at a time.
+Completed task records default to `state/tasks.history` beside the executable;
+use `--task-history` to place this append-only history elsewhere.
 
 ## PD SVG Generation
 

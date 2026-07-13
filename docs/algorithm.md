@@ -36,13 +36,43 @@ and direct/full HTTP request details.
 
 ## Invariant Pipeline
 
-Each PD computation request runs isolated worker processes for HOMFLY-PT and
-Khovanov. The server starts HOMFLY-PT and Khovanov on the original PD code,
-runs PD simplification in parallel, and retries missing invariants on the
-simplified PD code when useful.
+Each PD computation request enters a FIFO admission queue. Once admitted, the
+server runs PD simplification, HOMFLY-PT, and Khovanov in isolated child
+processes, with no more than one compute child active at a time. A useful
+simplified PD code is attempted before the original code. This sequential
+pipeline deliberately trades throughput for a bounded memory peak.
 
-The default worker timeout is 1200 seconds. A request can still use one
-invariant if the other one fails or times out.
+The adaptive memory controller reads physical availability on Windows and
+macOS, `/proc/meminfo` on Linux, and cgroup v1/v2 usage and limits when
+present. It keeps the larger of 512 MiB or 20 percent available for the server
+and operating system. Worker address space is limited with `RLIMIT_AS` on
+POSIX systems and a Windows Job Object on Windows. Linux workers raise their
+own `oom_score_adj`, so the kernel prefers terminating a compute child over
+the server if host-wide pressure still reaches the OOM killer. At startup the
+server also attempts to lower its own score to `-250`; Linux permits this when
+the process has sufficient privilege and otherwise leaves the score unchanged.
+The server also stops an active worker if free memory falls below half of its
+reserve.
+
+The default 1200-second deadline covers queue waiting, simplification, and all
+invariant attempts. Memory allocation failure, a memory-limit kill, or an
+unavailable memory budget produces `resource_exhausted`. Other successful
+invariants remain usable when possible.
+
+The result cache is an LRU bounded to 64 MiB by default and does not retain SVG
+payloads. Queued and running tasks stay in memory; completed tasks are appended
+to a framed disk history and removed from memory. The history reader validates
+record boundaries, repairs an incomplete final record after a crash, and pages
+backward without loading the full file. History responses are capped at 16 MiB.
+The FIFO holds at most 16 waiting computations, Task Monitor stores at most
+256 KiB of each displayed input, and HTTP/WebSocket connections are capped at
+128 to prevent request traffic from becoming an independent memory spike.
+
+The web application has one root URL. Lookup and Task Monitor remain mounted
+as Vue views and the navigation bar switches their visibility without browser
+navigation. Task Monitor loads completed pages through `/api`, receives active
+task changes through `/ws/tasks`, and shows a spinner while a task is actively
+computing.
 
 ## Candidate Lookup
 

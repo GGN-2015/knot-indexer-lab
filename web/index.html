@@ -11,12 +11,7 @@
 </head>
 
 <body data-bs-theme="dark">
-    <div id="navbar"></div>
     <div id="app"></div>
-
-    <main class="container app-shell">
-        <div id="indexer"></div>
-    </main>
     <script src="/static/bootstrap-5.3.2/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 
@@ -24,24 +19,39 @@
     const { createApp } = Vue;
     import NavBar from '/static/js/navbar.js';
     import Indexer from '/static/js/indexer.js';
-
-    const navbar = createApp(NavBar);
-    const indexer = createApp(Indexer);
+    import Tasks from '/static/js/tasks.js';
 
     const app = createApp({
+        components: { NavBar, Indexer, Tasks },
         data() {
             return {
                 website_title: "knot-indexer-lab",
+                activeView: "home",
             };
         },
-        async mounted() {
+        mounted() {
             document.title = this.website_title;
         },
+        methods: {
+            showView(view) {
+                this.activeView = view === "tasks" ? "tasks" : "home";
+                window.scrollTo({ top: 0, behavior: "auto" });
+            },
+        },
+        template: `
+            <NavBar :active-view="activeView" @navigate="showView" />
+            <main class="container app-shell">
+                <section v-show="activeView === 'home'" aria-label="Knot lookup">
+                    <Indexer @navigate="showView" />
+                </section>
+                <section v-show="activeView === 'tasks'" aria-label="Task monitor">
+                    <Tasks @navigate="showView" />
+                </section>
+            </main>
+        `,
     });
 
     app.mount('#app');
-    navbar.mount("#navbar");
-    indexer.mount("#indexer");
 </script>
 
 </html>

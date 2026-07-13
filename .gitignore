@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+state/
 
 # Runtime knot databases are too large for ordinary GitHub storage.
 data/name-pd/PD_m_3-16.sorted.txt

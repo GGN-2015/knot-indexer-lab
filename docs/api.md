@@ -47,13 +47,22 @@ returns the resulting PD code without computing invariants.
 
 ```text
 GET  /api/tasks
+GET  /api/tasks/history/<cursor>
 POST /api/tasks/<task-id>/cancel
 WS   /ws/tasks
 ```
 
 The server associates task state with the `kil_client_id` browser cookie. The
-WebSocket stream sends the current task list repeatedly, which lets the browser
-recover task state after a refresh.
+WebSocket stream sends queued and running tasks plus the latest task for the
+current browser, which lets the browser recover state after a refresh.
+The browser stays at `/`; switching between knot lookup and Task Monitor is a
+client-side Vue view change and does not navigate to another HTML route.
+
+Completed records are stored on disk. `/api/tasks/history/0` returns the newest
+100 records. Use the returned `next_cursor` in the next request while
+`has_more` is true. Task and invariant statuses can include `queued`,
+`running`, `completed`, `failed`, `cancelled`, `timed_out`, and
+`resource_exhausted`.
 
 ## Build Info
 

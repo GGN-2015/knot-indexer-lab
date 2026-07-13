@@ -19,6 +19,7 @@
 #include "pd_simplify_backend.hpp"
 #include "path_utils.hpp"
 #include "process_runner.hpp"
+#include "resource_control.hpp"
 #include "runtime_control.hpp"
 
 #ifndef DEBUG
@@ -61,6 +62,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -101,6 +103,7 @@ constexpr int kDefaultMaxCrossing = 14;
 constexpr int kHardMaxCrossing = 16;
 constexpr std::size_t kMaxHeaderBytes = 64 * 1024;
 constexpr std::size_t kMaxBodyBytes = 8 * 1024 * 1024;
+constexpr int kMaxClientConnections = 128;
 
 #ifdef _WIN32
 using Socket = SOCKET;
@@ -115,8 +118,12 @@ struct Options {
     int port = kDefaultPort;
     int timeoutSeconds = kMaxComputeTimeoutSeconds;
     int maxCrossing = kDefaultMaxCrossing;
+    std::uint64_t workerMemoryMb = 0;
+    std::uint64_t memoryReserveMb = 0;
+    std::uint64_t cacheMemoryMb = 64;
     std::filesystem::path dataFolder;
     std::filesystem::path webRoot;
+    std::filesystem::path taskHistory;
     bool renderPdSvg = false;
     bool svgInputFromFile = false;
     bool svgInputInline = false;
@@ -686,6 +693,8 @@ std::string workerFailureMessage(const char* name, const hki::WorkerResult& resu
         out << "timed out after " << result.seconds << "s";
     } else if (result.interrupted) {
         out << "was interrupted";
+    } else if (result.resourceExhausted) {
+        out << "stopped because the memory limit was reached";
     } else {
         out << "failed with exit code " << result.exitCode;
     }
@@ -698,6 +707,7 @@ std::string workerStatusText(const hki::WorkerResult& result) {
     if (result.cancelled) return "cancelled";
     if (result.timedOut) return "timed_out";
     if (result.interrupted) return "interrupted";
+    if (result.resourceExhausted) return "resource_exhausted";
     if (result.exitCode != -1) return "failed";
     return "pending";
 }
@@ -719,7 +729,7 @@ private:
 struct TaskRecord {
     std::uint64_t id = 0;
     std::string clientId;
-    std::string status = "running";
+    std::string status = "queued";
     std::string inputType;
     std::string input;
     std::string canonicalPd;
@@ -739,16 +749,204 @@ struct TaskRecord {
     std::shared_ptr<CancellationToken> cancellation;
 };
 
+class TaskHistoryStore {
+public:
+    struct Page {
+        std::vector<std::string> records;
+        std::uint64_t nextCursor = 0;
+        bool hasMore = false;
+    };
+
+    explicit TaskHistoryStore(std::filesystem::path path) : path_(std::move(path)) {
+        try {
+            if (!path_.parent_path().empty()) std::filesystem::create_directories(path_.parent_path());
+            repairAndFindMaximumId();
+        } catch (const std::exception& error) {
+            enabled_ = false;
+            std::cerr << "warning: task history disabled: " << error.what() << "\n";
+        }
+    }
+
+    std::uint64_t maximumId() const { return maximumId_; }
+    const std::filesystem::path& path() const { return path_; }
+
+    bool append(std::uint64_t id, const std::string& clientId, const std::string& json) {
+        if (!enabled_) return false;
+        try {
+            const std::string payload = std::to_string(id) + "\t" + clientId + "\n" + json;
+            const std::uint64_t length = static_cast<std::uint64_t>(payload.size());
+            if (length > kMaximumRecordBytes) throw std::runtime_error("task history record exceeds 16 MiB");
+            std::ofstream output(path_, std::ios::binary | std::ios::app);
+            if (!output) throw std::runtime_error("cannot open " + path_.string());
+            writeNumber(output, length);
+            output.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+            writeNumber(output, length);
+            output.flush();
+            if (!output) throw std::runtime_error("cannot append " + path_.string());
+            maximumId_ = std::max(maximumId_, id);
+            writeLatestClient(clientId, json);
+            return true;
+        } catch (const std::exception& error) {
+            std::cerr << "warning: could not persist task history: " << error.what() << "\n";
+            return false;
+        }
+    }
+
+    Page newest(std::uint64_t beforeCursor, std::size_t limit) const {
+        Page page;
+        if (!enabled_ || limit == 0 || !existsPath(path_)) return page;
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) return page;
+        input.seekg(0, std::ios::end);
+        const std::uint64_t size = static_cast<std::uint64_t>(input.tellg());
+        std::uint64_t cursor = beforeCursor == 0 || beforeCursor > size ? size : beforeCursor;
+        std::uint64_t pageBytes = 0;
+        while (cursor >= frameOverhead() && page.records.size() < limit) {
+            std::uint64_t length = 0;
+            if (!readNumberAt(input, cursor - sizeof(length), length) ||
+                length > kMaximumRecordBytes || length + frameOverhead() > cursor) break;
+            const std::uint64_t start = cursor - frameOverhead() - length;
+            if (pageBytes + length > kMaximumPageBytes && !page.records.empty()) break;
+            std::uint64_t headerLength = 0;
+            if (!readNumberAt(input, start, headerLength) || headerLength != length) break;
+            std::string payload(static_cast<std::size_t>(length), '\0');
+            input.clear();
+            input.seekg(static_cast<std::streamoff>(start + sizeof(length)), std::ios::beg);
+            input.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+            if (!input) break;
+            const std::size_t newline = payload.find('\n');
+            if (newline == std::string::npos) break;
+            page.records.push_back(payload.substr(newline + 1));
+            pageBytes += length;
+            cursor = start;
+        }
+        page.nextCursor = cursor;
+        page.hasMore = cursor >= frameOverhead();
+        return page;
+    }
+
+    std::string latestForClient(const std::string& clientId) const {
+        if (!enabled_ || clientId.empty()) return "";
+        const std::filesystem::path latestPath = latestDirectory() / (clientFileName(clientId) + ".json");
+        std::ifstream input(latestPath, std::ios::binary);
+        if (!input) return "";
+        std::string storedClient;
+        if (!std::getline(input, storedClient) || storedClient != clientId) return "";
+        std::ostringstream json;
+        json << input.rdbuf();
+        return json.str();
+    }
+
+private:
+    static constexpr std::uint64_t kMaximumRecordBytes = 16ULL * 1024ULL * 1024ULL;
+    static constexpr std::uint64_t kMaximumPageBytes = 16ULL * 1024ULL * 1024ULL;
+    std::filesystem::path path_;
+    bool enabled_ = true;
+    std::uint64_t maximumId_ = 0;
+
+    static constexpr std::uint64_t frameOverhead() { return 2 * sizeof(std::uint64_t); }
+
+    static void writeNumber(std::ostream& output, std::uint64_t value) {
+        output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    }
+
+    static bool readNumberAt(std::istream& input, std::uint64_t offset, std::uint64_t& value) {
+        input.clear();
+        input.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        input.read(reinterpret_cast<char*>(&value), sizeof(value));
+        return static_cast<bool>(input);
+    }
+
+    static std::uint64_t parseRecordId(const std::string& payload) {
+        const std::size_t tab = payload.find('\t');
+        if (tab == std::string::npos) return 0;
+        try {
+            return static_cast<std::uint64_t>(std::stoull(payload.substr(0, tab)));
+        } catch (const std::exception&) {
+            return 0;
+        }
+    }
+
+    void repairAndFindMaximumId() {
+        if (!existsPath(path_)) return;
+        std::ifstream input(path_, std::ios::binary);
+        if (!input) throw std::runtime_error("cannot read " + path_.string());
+        input.seekg(0, std::ios::end);
+        const std::uint64_t size = static_cast<std::uint64_t>(input.tellg());
+        std::uint64_t cursor = 0;
+        std::uint64_t validEnd = 0;
+        while (cursor + frameOverhead() <= size) {
+            std::uint64_t length = 0;
+            if (!readNumberAt(input, cursor, length) || length > kMaximumRecordBytes ||
+                cursor + frameOverhead() + length > size) break;
+            std::string payload(static_cast<std::size_t>(length), '\0');
+            input.read(payload.data(), static_cast<std::streamsize>(payload.size()));
+            std::uint64_t footer = 0;
+            input.read(reinterpret_cast<char*>(&footer), sizeof(footer));
+            if (!input || footer != length || payload.find('\n') == std::string::npos) break;
+            maximumId_ = std::max(maximumId_, parseRecordId(payload));
+            cursor += frameOverhead() + length;
+            validEnd = cursor;
+        }
+        input.close();
+        if (validEnd != size) {
+            std::filesystem::resize_file(path_, validEnd);
+            std::cerr << "warning: truncated incomplete task history tail in " << path_.string() << "\n";
+        }
+    }
+
+    std::filesystem::path latestDirectory() const {
+        return path_.parent_path() / (path_.filename().string() + ".clients");
+    }
+
+    static std::string clientFileName(const std::string& clientId) {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (unsigned char c : clientId) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        std::ostringstream out;
+        out << std::hex << std::setw(16) << std::setfill('0') << hash;
+        return out.str();
+    }
+
+    void writeLatestClient(const std::string& clientId, const std::string& json) const {
+        if (clientId.empty()) return;
+        const std::filesystem::path directory = latestDirectory();
+        std::filesystem::create_directories(directory);
+        const std::filesystem::path target = directory / (clientFileName(clientId) + ".json");
+        const std::filesystem::path temporary = target.string() + ".tmp";
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) throw std::runtime_error("cannot write latest client task");
+            output << clientId << "\n" << json;
+        }
+        std::error_code ec;
+        std::filesystem::remove(target, ec);
+        ec.clear();
+        std::filesystem::rename(temporary, target, ec);
+        if (ec) throw std::runtime_error("cannot publish latest client task: " + ec.message());
+    }
+};
+
 class TaskManager {
 public:
     using TaskPtr = std::shared_ptr<TaskRecord>;
 
+    explicit TaskManager(std::filesystem::path historyPath)
+        : history_(std::move(historyPath)), nextId_(history_.maximumId() + 1) {}
+
     TaskPtr create(std::string clientId, std::string inputType, std::string input) {
+        constexpr std::size_t maximumStoredInputBytes = 256 * 1024;
         auto task = std::make_shared<TaskRecord>();
         task->id = nextId_.fetch_add(1, std::memory_order_relaxed);
         task->clientId = std::move(clientId);
         task->inputType = std::move(inputType);
-        task->input = std::move(input);
+        if (input.size() > maximumStoredInputBytes) {
+            task->input = input.substr(0, maximumStoredInputBytes) + "\n...[input truncated by task monitor]";
+        } else {
+            task->input = std::move(input);
+        }
         task->startedAt = localTimestamp();
         task->cancellation = std::make_shared<CancellationToken>();
         {
@@ -762,7 +960,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& task : tasks_) {
             if (task->id != id) continue;
-            if (task->status != "running") {
+            if (task->status != "running" && task->status != "queued") {
                 message = "task is not running.";
                 return false;
             }
@@ -773,6 +971,12 @@ public:
         }
         message = "task not found.";
         return false;
+    }
+
+    void markRunning(const TaskPtr& task) {
+        if (!task) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (task->status == "queued") task->status = "running";
     }
 
     void setCanonicalPd(const TaskPtr& task,
@@ -807,9 +1011,12 @@ public:
         task->endedAt = localTimestamp();
         if (result.homflyWorker.cancelled || result.khovanovWorker.cancelled || task->cancelRequested) {
             task->status = "cancelled";
+        } else if (!result.homflyWorker.success && !result.khovanovWorker.success && result.candidates.empty()) {
+            task->status = "failed";
         } else {
             task->status = "completed";
         }
+        persistAndRemoveLocked(task);
     }
 
     void fail(const TaskPtr& task, const std::string& error) {
@@ -822,6 +1029,20 @@ public:
             if (task->homflyStatus == "pending") task->homflyStatus = "cancelled";
             if (task->khovanovStatus == "pending") task->khovanovStatus = "cancelled";
         }
+        persistAndRemoveLocked(task);
+    }
+
+    void failResourceExhausted(const TaskPtr& task, const std::string& error) {
+        if (!task) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        task->endedAt = localTimestamp();
+        task->error = error;
+        task->status = "failed";
+        task->homflyStatus = "resource_exhausted";
+        task->khovanovStatus = "resource_exhausted";
+        task->homflyError = error;
+        task->khovanovError = error;
+        persistAndRemoveLocked(task);
     }
 
     std::string toJson(const std::string& clientId = "") const {
@@ -844,13 +1065,37 @@ public:
             latest = task.get();
         }
         out << "],\"last_session_task\":";
-        if (latest) appendTaskJson(out, *latest);
-        else out << "null";
+        if (latest) {
+            appendTaskJson(out, *latest);
+        } else {
+            const std::string persisted = history_.latestForClient(clientId);
+            if (persisted.empty()) out << "null";
+            else out << persisted;
+        }
         out << "}";
         return out.str();
     }
 
+    std::string historyJson(std::uint64_t cursor, std::size_t limit) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const TaskHistoryStore::Page page = history_.newest(cursor, std::min<std::size_t>(limit, 200));
+        std::ostringstream out;
+        out << "{\"status\":\"success\",\"tasks\":[";
+        for (std::size_t i = 0; i < page.records.size(); ++i) {
+            if (i) out << ",";
+            out << page.records[i];
+        }
+        out << "],\"next_cursor\":" << page.nextCursor
+            << ",\"has_more\":" << (page.hasMore ? "true" : "false") << "}";
+        return out.str();
+    }
+
+    std::string historyStatus() const {
+        return cki::platform::displayPath(history_.path());
+    }
+
 private:
+    TaskHistoryStore history_;
     std::atomic_uint64_t nextId_{1};
     mutable std::mutex mutex_;
     std::vector<TaskPtr> tasks_;
@@ -877,6 +1122,17 @@ private:
             << "\"error\":\"" << jsonEscape(task.error) << "\","
             << "\"cancel_requested\":" << (task.cancelRequested ? "true" : "false")
             << "}";
+    }
+
+    static std::string taskJson(const TaskRecord& task) {
+        std::ostringstream out;
+        appendTaskJson(out, task);
+        return out.str();
+    }
+
+    void persistAndRemoveLocked(const TaskPtr& task) {
+        history_.append(task->id, task->clientId, taskJson(*task));
+        tasks_.erase(std::remove(tasks_.begin(), tasks_.end(), task), tasks_.end());
     }
 };
 
@@ -1684,41 +1940,55 @@ public:
     KnotEngine(std::filesystem::path executable,
                DataPaths dataPaths,
                int timeoutSeconds,
-               int maxCrossing)
+               int maxCrossing,
+               const AdaptiveMemoryController& memory,
+               ComputeQueue& computeQueue,
+               std::size_t cacheMemoryBytes)
         : executable_(std::move(executable)),
           dataPaths_(std::move(dataPaths)),
           timeoutSeconds_(timeoutSeconds),
           maxCrossing_(maxCrossing),
+          memory_(memory),
+          computeQueue_(computeQueue),
+          cacheMemoryLimitBytes_(cacheMemoryBytes),
           nameNormalizer_(dataPaths_.knotNameRegDir),
           namePdLookup_(dataPaths_.primePdDb),
           homflyIndex_(hki::loadInvariantMap(dataPaths_.homflyDb, nameNormalizer_)),
           khovanovIndex_(hki::loadInvariantMap(dataPaths_.khovanovDb, nameNormalizer_)) {}
 
     LookupResult lookup(const std::string& pdText,
-                        const std::shared_ptr<CancellationToken>& cancellation = nullptr) {
+                        const std::shared_ptr<CancellationToken>& cancellation = nullptr,
+                        const std::function<void()>& onStarted = {}) {
         const hki::PDCode pd = hki::parsePDCode(pdText);
         const std::string canonical = hki::formatPDCodeList(pd);
-        const PdDiagram diagram = buildPdDiagram(canonical);
-        {
-            std::lock_guard<std::mutex> lock(cacheMutex_);
-            const auto found = cache_.find(canonical);
-            if (found != cache_.end()) {
-                LookupResult cached = found->second;
-                cached.pdDiagramSvg = diagram.svg;
-                cached.pdDiagramError = diagram.error;
-                return cached;
-            }
+        if (auto cached = findCached(canonical)) {
+            const PdDiagram diagram = buildPdDiagram(canonical);
+            cached->pdDiagramSvg = diagram.svg;
+            cached->pdDiagramError = diagram.error;
+            return *cached;
         }
 
-        LookupResult result = compute(canonical, cancellation);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds_);
+        const auto cancelled = [&] {
+            return hki::interrupted() || (cancellation && cancellation->cancelled());
+        };
+        ComputeQueue::Lease lease = computeQueue_.acquire(deadline, cancelled, onStarted);
+        if (auto cached = findCached(canonical)) {
+            const PdDiagram diagram = buildPdDiagram(canonical);
+            cached->pdDiagramSvg = diagram.svg;
+            cached->pdDiagramError = diagram.error;
+            return *cached;
+        }
+
+        LookupResult result = compute(canonical, cancellation, deadline);
+        const PdDiagram diagram = buildPdDiagram(result.canonicalPd);
         result.pdDiagramSvg = diagram.svg;
         result.pdDiagramError = diagram.error;
         const bool cacheable = !result.homflyWorker.cancelled &&
                                !result.khovanovWorker.cancelled &&
                                (result.homflyWorker.success || result.khovanovWorker.success);
         if (cacheable) {
-            std::lock_guard<std::mutex> lock(cacheMutex_);
-            cache_[canonical] = result;
+            putCached(canonical, result);
         }
         return result;
     }
@@ -1749,12 +2019,68 @@ private:
     DataPaths dataPaths_;
     int timeoutSeconds_ = kMaxComputeTimeoutSeconds;
     int maxCrossing_ = kDefaultMaxCrossing;
+    const AdaptiveMemoryController& memory_;
+    ComputeQueue& computeQueue_;
+    std::size_t cacheMemoryLimitBytes_ = 0;
     hki::NameNormalizer nameNormalizer_;
     NamePdLookup namePdLookup_;
     hki::InvariantMap homflyIndex_;
     hki::InvariantMap khovanovIndex_;
     std::mutex cacheMutex_;
-    std::unordered_map<std::string, LookupResult> cache_;
+    struct CacheEntry {
+        LookupResult result;
+        std::size_t bytes = 0;
+        std::list<std::string>::iterator lru;
+    };
+    std::unordered_map<std::string, CacheEntry> cache_;
+    std::list<std::string> cacheLru_;
+    std::size_t cacheBytes_ = 0;
+
+    static std::size_t resultBytes(const std::string& key, const LookupResult& result) {
+        std::size_t bytes = key.size() + result.canonicalPd.size() + result.homfly.size() +
+            result.khovanov.size() + result.candidateError.size() + result.homflyWorker.output.size() +
+            result.homflyWorker.error.size() + result.khovanovWorker.output.size() +
+            result.khovanovWorker.error.size();
+        for (const std::string& candidate : result.candidates) bytes += candidate.size();
+        return bytes + sizeof(CacheEntry);
+    }
+
+    std::optional<LookupResult> findCached(const std::string& canonical) {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        const auto found = cache_.find(canonical);
+        if (found == cache_.end()) return std::nullopt;
+        cacheLru_.splice(cacheLru_.begin(), cacheLru_, found->second.lru);
+        return found->second.result;
+    }
+
+    void putCached(const std::string& canonical, const LookupResult& source) {
+        if (cacheMemoryLimitBytes_ == 0) return;
+        LookupResult result = source;
+        result.pdDiagramSvg.clear();
+        result.pdDiagramError.clear();
+        const std::size_t bytes = resultBytes(canonical, result);
+        if (bytes > cacheMemoryLimitBytes_) return;
+
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        const auto existing = cache_.find(canonical);
+        if (existing != cache_.end()) {
+            cacheBytes_ -= existing->second.bytes;
+            cacheLru_.erase(existing->second.lru);
+            cache_.erase(existing);
+        }
+        cacheLru_.push_front(canonical);
+        cache_.emplace(canonical, CacheEntry{std::move(result), bytes, cacheLru_.begin()});
+        cacheBytes_ += bytes;
+        while (cacheBytes_ > cacheMemoryLimitBytes_ && !cacheLru_.empty()) {
+            const std::string key = cacheLru_.back();
+            const auto found = cache_.find(key);
+            if (found != cache_.end()) {
+                cacheBytes_ -= found->second.bytes;
+                cache_.erase(found);
+            }
+            cacheLru_.pop_back();
+        }
+    }
 
     std::optional<int> crossingNumberForName(const std::string& rawName) const {
         const std::string canonicalName = nameNormalizer_.normalize(rawName);
@@ -1791,12 +2117,6 @@ private:
         SimplifyRetry,
     };
 
-    struct RunningAttempt {
-        InvariantKind kind;
-        std::string source;
-        std::unique_ptr<hki::WorkerProcess> process;
-    };
-
     struct SelectedInvariant {
         hki::WorkerResult result;
         std::string source;
@@ -1811,14 +2131,6 @@ private:
                                           SelectedInvariant& khovanov,
                                           InvariantKind kind) {
         return kind == InvariantKind::Homfly ? homfly : khovanov;
-    }
-
-    static bool hasRunningSource(const std::vector<RunningAttempt>& running,
-                                 InvariantKind kind,
-                                 const std::string& source) {
-        return std::any_of(running.begin(), running.end(), [kind, &source](const RunningAttempt& attempt) {
-            return attempt.kind == kind && attempt.source == source;
-        });
     }
 
     static void recordAttempt(SelectedInvariant& selected,
@@ -1838,145 +2150,99 @@ private:
         }
     }
 
-    static void cancelRunningKind(std::vector<RunningAttempt>& running, InvariantKind kind) {
-        for (RunningAttempt& attempt : running) {
-            if (attempt.kind == kind) cancelWorkerProcess(*attempt.process);
+    hki::WorkerResult runLimitedWorker(const std::string& workerName,
+                                       const std::string& pdText,
+                                       std::chrono::steady_clock::time_point deadline,
+                                       const std::shared_ptr<CancellationToken>& cancellation) {
+        const auto cancelled = [&] {
+            return hki::interrupted() || (cancellation && cancellation->cancelled());
+        };
+        hki::WorkerResult result;
+        std::uint64_t memoryLimit = 0;
+        try {
+            memoryLimit = memory_.waitForWorkerLimit(deadline, cancelled);
+        } catch (const ComputeCancelledError&) {
+            result.cancelled = !hki::interrupted();
+            result.interrupted = hki::interrupted();
+            result.exitCode = result.interrupted ? 130 : 125;
+            return result;
+        } catch (const ResourceExhaustedError& error) {
+            result.resourceExhausted = true;
+            result.exitCode = 126;
+            result.error = error.what();
+            return result;
         }
-    }
 
-    static void eraseCancelledAttempts(std::vector<RunningAttempt>& running) {
-        running.erase(
-            std::remove_if(running.begin(), running.end(), [](const RunningAttempt& attempt) {
-                return attempt.process->result().cancelled;
-            }),
-            running.end());
+        hki::WorkerLimits limits;
+        limits.memoryBytes = memoryLimit;
+        limits.linuxOomScoreAdjust = 750;
+        std::unique_ptr<hki::WorkerProcess> process;
+        try {
+            process = hki::startWorkerProcess(executable_, workerName, pdText, limits);
+        } catch (const std::exception& error) {
+            result.resourceExhausted = true;
+            result.exitCode = 126;
+            result.error = error.what();
+            return result;
+        }
+        while (!hki::pollWorkerProcess(*process, deadline)) {
+            if (cancellation && cancellation->cancelled()) {
+                hki::cancelWorkerProcess(*process);
+                break;
+            }
+            if (memory_.emergencyPressure()) {
+                hki::exhaustWorkerProcess(*process, "worker stopped to preserve the server memory reserve");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return hki::finishWorkerProcess(*process);
     }
 
     LookupResult computeInvariants(const std::string& canonicalPd,
                                    const std::shared_ptr<CancellationToken>& cancellation,
-                                   InvariantPipelineMode mode) {
-        const auto deadline = timeoutSeconds_ > 0
-            ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds_)
-            : std::chrono::steady_clock::time_point::max();
-
+                                   InvariantPipelineMode mode,
+                                   std::chrono::steady_clock::time_point deadline) {
         LookupResult result;
         result.canonicalPd = canonicalPd;
 
-        SelectedInvariant homfly;
-        SelectedInvariant khovanov;
-        std::vector<RunningAttempt> running;
-
-        auto startInvariant = [&](InvariantKind kind, const std::string& source, const std::string& pdText) {
-            SelectedInvariant& selected = selectedFor(homfly, khovanov, kind);
-            if (selected.result.success || hasRunningSource(running, kind, source)) return;
-            running.push_back(RunningAttempt{
-                kind,
-                source,
-                hki::startWorkerProcess(executable_, workerNameFor(kind), pdText),
-            });
-        };
-
-        startInvariant(InvariantKind::Homfly, "original", canonicalPd);
-        startInvariant(InvariantKind::Khovanov, "original", canonicalPd);
-
-        const bool allowSimplifyRetry = mode == InvariantPipelineMode::SimplifyRetry;
-        std::unique_ptr<hki::WorkerProcess> simplify =
-            allowSimplifyRetry ? hki::startWorkerProcess(executable_, "simplify", canonicalPd) : nullptr;
-        hki::WorkerResult simplifyResult;
-        std::string simplifiedPd;
-        bool simplifyFinished = !allowSimplifyRetry;
-        bool simplifiedAttemptsStarted = false;
-
-        auto maybeStartSimplifiedAttempts = [&]() {
-            if (simplifiedAttemptsStarted || simplifiedPd.empty() || simplifiedPd == canonicalPd) return;
-            simplifiedAttemptsStarted = true;
-            result.canonicalPd = simplifiedPd;
-            if (!homfly.result.success) startInvariant(InvariantKind::Homfly, "simplified", simplifiedPd);
-            if (!khovanov.result.success) startInvariant(InvariantKind::Khovanov, "simplified", simplifiedPd);
-        };
-
-        auto cancelAll = [&]() {
-            if (simplify && !simplifyFinished) {
-                hki::cancelWorkerProcess(*simplify);
-                simplifyResult = hki::finishWorkerProcess(*simplify);
-                simplifyFinished = true;
+        std::vector<std::pair<std::string, std::string>> sources;
+        if (mode == InvariantPipelineMode::SimplifyRetry) {
+            const hki::WorkerResult simplified = runLimitedWorker("simplify", canonicalPd, deadline, cancellation);
+            if (simplified.success && !simplified.output.empty() && simplified.output != canonicalPd) {
+                result.canonicalPd = simplified.output;
+                sources.push_back({"simplified", simplified.output});
             }
-            for (RunningAttempt& attempt : running) {
-                hki::cancelWorkerProcess(*attempt.process);
-                hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
-                recordAttempt(selectedFor(homfly, khovanov, attempt.kind), attempt.source, workerResult);
+            if (simplified.cancelled || simplified.interrupted) {
+                result.homflyWorker = simplified;
+                result.khovanovWorker = simplified;
+                return result;
             }
-            running.clear();
-        };
-
-        while (true) {
-            if (cancellation && cancellation->cancelled()) {
-                cancelAll();
-                break;
-            }
-            if (hki::interrupted()) {
-                cancelAll();
-                homfly.result.interrupted = true;
-                khovanov.result.interrupted = true;
-                break;
-            }
-
-            if (simplify && !simplifyFinished && hki::pollWorkerProcess(*simplify, deadline)) {
-                simplifyResult = hki::finishWorkerProcess(*simplify);
-                simplifyFinished = true;
-                if (simplifyResult.success) {
-                    simplifiedPd = simplifyResult.output;
-                    maybeStartSimplifiedAttempts();
-                }
-            }
-
-            for (std::size_t i = 0; i < running.size();) {
-                RunningAttempt& attempt = running[i];
-                if (!hki::pollWorkerProcess(*attempt.process, deadline)) {
-                    ++i;
-                    continue;
-                }
-
-                hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
-                SelectedInvariant& selected = selectedFor(homfly, khovanov, attempt.kind);
-                const bool alreadySelected = selected.result.success;
-                recordAttempt(selected, attempt.source, workerResult);
-                if (workerResult.success && !alreadySelected) {
-                    cancelRunningKind(running, attempt.kind);
-                }
-                running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
-                eraseCancelledAttempts(running);
-            }
-
-            if (homfly.result.success && khovanov.result.success && simplify && !simplifyFinished) {
-                hki::cancelWorkerProcess(*simplify);
-                simplifyResult = hki::finishWorkerProcess(*simplify);
-                simplifyFinished = true;
-            }
-
-            if (simplifyFinished) maybeStartSimplifiedAttempts();
-            if (running.empty() && simplifyFinished) break;
-
-            if (std::chrono::steady_clock::now() >= deadline) {
-                if (simplify && !simplifyFinished) {
-                    hki::pollWorkerProcess(*simplify, deadline);
-                    simplifyResult = hki::finishWorkerProcess(*simplify);
-                    simplifyFinished = true;
-                }
-                for (RunningAttempt& attempt : running) {
-                    hki::pollWorkerProcess(*attempt.process, deadline);
-                    hki::WorkerResult workerResult = hki::finishWorkerProcess(*attempt.process);
-                    recordAttempt(selectedFor(homfly, khovanov, attempt.kind), attempt.source, workerResult);
-                }
-                running.clear();
-                break;
-            }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        sources.push_back({"original", canonicalPd});
 
-        result.homflyWorker = homfly.result;
-        result.khovanovWorker = khovanov.result;
+        auto computeOne = [&](InvariantKind kind) {
+            SelectedInvariant selected;
+            for (const auto& source : sources) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    selected.result.timedOut = true;
+                    selected.result.exitCode = 124;
+                    break;
+                }
+                const hki::WorkerResult attempt =
+                    runLimitedWorker(workerNameFor(kind), source.second, deadline, cancellation);
+                recordAttempt(selected, source.first, attempt);
+                if (attempt.success || attempt.cancelled || attempt.interrupted || attempt.resourceExhausted) break;
+            }
+            return selected.result;
+        };
+
+        result.homflyWorker = computeOne(InvariantKind::Homfly);
+        if (result.homflyWorker.cancelled || result.homflyWorker.interrupted) {
+            result.khovanovWorker = result.homflyWorker;
+        } else {
+            result.khovanovWorker = computeOne(InvariantKind::Khovanov);
+        }
 
         if (hki::interrupted() ||
             (result.homflyWorker.interrupted && !result.homflyWorker.cancelled) ||
@@ -1994,8 +2260,10 @@ private:
     }
 
     LookupResult compute(const std::string& canonicalPd,
-                         const std::shared_ptr<CancellationToken>& cancellation) {
-        LookupResult result = computeInvariants(canonicalPd, cancellation, InvariantPipelineMode::SimplifyRetry);
+                         const std::shared_ptr<CancellationToken>& cancellation,
+                         std::chrono::steady_clock::time_point deadline) {
+        LookupResult result = computeInvariants(
+            canonicalPd, cancellation, InvariantPipelineMode::SimplifyRetry, deadline);
 
         std::optional<std::string> homfly;
         std::optional<std::string> khovanov;
@@ -2236,7 +2504,8 @@ public:
             if (request.method == "GET" && request.path == "/") {
                 response = serveFile(webRoot_, "index.html");
             } else if (request.method == "GET" && request.path == "/tasks.html") {
-                response = serveFile(webRoot_, "tasks.html");
+                response = makeText(302, "Found", "", "text/plain; charset=utf-8");
+                response.headers["Location"] = "/";
             } else if (request.method == "GET" && startsWith(request.path, "/static/")) {
                 response = serveFile(webRoot_, request.path.substr(1));
             } else if (request.method == "GET" && startsWith(request.path, "/img/")) {
@@ -2297,6 +2566,14 @@ private:
     Response handleApi(const Request& request, const std::string& clientId) {
         if (request.method == "GET" && request.path == "/api/tasks") {
             return makeText(200, "OK", tasks_.toJson(clientId), "application/json; charset=utf-8");
+        }
+
+        if (request.method == "GET" && startsWith(request.path, "/api/tasks/history/")) {
+            const std::string cursorText = request.path.substr(std::string("/api/tasks/history/").size());
+            std::size_t used = 0;
+            const std::uint64_t cursor = static_cast<std::uint64_t>(std::stoull(cursorText, &used, 10));
+            if (used != cursorText.size()) return makeJsonError("bad task history cursor.");
+            return makeText(200, "OK", tasks_.historyJson(cursor, 100), "application/json; charset=utf-8");
         }
 
         if (request.method == "POST" && startsWith(request.path, "/api/tasks/") && endsWith(request.path, "/cancel")) {
@@ -2393,11 +2670,15 @@ private:
         auto task = tasks_.create(clientId, inputType, input);
         try {
             const std::string pd = resolvePd();
-            const PdDiagram diagram = buildPdDiagram(pd);
-            tasks_.setCanonicalPd(task, pd, diagram.svg, diagram.error);
-            const LookupResult result = engine_.lookup(pd, task->cancellation);
+            tasks_.setCanonicalPd(task, pd, "", "");
+            const LookupResult result = engine_.lookup(pd, task->cancellation, [&] {
+                tasks_.markRunning(task);
+            });
             tasks_.complete(task, result);
             return makeLookupJson(task, result);
+        } catch (const ResourceExhaustedError& error) {
+            tasks_.failResourceExhausted(task, error.what());
+            return makeTaskFailureJson(task, error.what());
         } catch (const std::exception& error) {
             tasks_.fail(task, error.what());
             return makeTaskFailureJson(task, error.what());
@@ -2498,7 +2779,20 @@ public:
                 if (hki::interrupted()) break;
                 continue;
             }
-            std::thread(&HttpServer::handleClient, this, client).detach();
+            if (activeClients_.fetch_add(1, std::memory_order_relaxed) >= kMaxClientConnections) {
+                activeClients_.fetch_sub(1, std::memory_order_relaxed);
+                const Response response = makeText(503, "Service Unavailable", "server connection limit reached", "text/plain; charset=utf-8");
+                sendAll(client, response.serialize());
+                closeSocket(client);
+                continue;
+            }
+            try {
+                std::thread(&HttpServer::handleClient, this, client).detach();
+            } catch (...) {
+                activeClients_.fetch_sub(1, std::memory_order_relaxed);
+                closeSocket(client);
+                throw;
+            }
         }
         closeSocket(server);
     }
@@ -2507,6 +2801,7 @@ private:
     std::string host_;
     int port_ = kDefaultPort;
     Application& app_;
+    std::atomic_int activeClients_{0};
 
     void handleClient(Socket client) {
         try {
@@ -2524,6 +2819,7 @@ private:
             sendAll(client, response.serialize());
         }
         closeSocket(client);
+        activeClients_.fetch_sub(1, std::memory_order_relaxed);
     }
 };
 
@@ -2535,10 +2831,14 @@ void usage(std::ostream& out) {
         << "Options:\n"
         << "  --host ADDRESS       IPv4 address to bind. Default: 0.0.0.0\n"
         << "  --port PORT          TCP port. Default: 5000\n"
-        << "  --data-folder PATH   Folder containing homfly/, khovanov/, and knotname-reg/.\n"
+        << "  --data-folder PATH   Folder containing homfly/, khovanov/, knotname-reg/, and name-pd/.\n"
         << "  --web-root PATH      Folder containing index.html and static/.\n"
         << "  --timeout SEC        Worker timeout, capped at 1200 seconds. Default: 1200\n"
         << "  --max-crossing N     Maximum total crossing number. Default: 14, max: 16\n"
+        << "  --worker-memory-mb N Maximum memory per compute worker. Default: adaptive (cap 4096)\n"
+        << "  --memory-reserve-mb N Memory kept free for the server and OS. Default: adaptive\n"
+        << "  --cache-memory-mb N  In-memory result cache limit. Default: 64, 0 disables\n"
+        << "  --task-history PATH  Persistent completed-task history file.\n"
         << "  --render-pd-svg      Render a PD code as an SVG and exit.\n"
         << "  --pd TEXT            Inline PD code for --render-pd-svg.\n"
         << "  --input PATH         PD-code input file for --render-pd-svg.\n"
@@ -2556,6 +2856,20 @@ int parsePositiveInt(const std::string& value, const std::string& name) {
     }
     if (used != value.size() || parsed <= 0) throw std::runtime_error(name + " must be positive");
     return parsed;
+}
+
+std::uint64_t parseNonNegativeMb(const std::string& value, const std::string& name) {
+    std::size_t used = 0;
+    unsigned long long parsed = 0;
+    try {
+        parsed = std::stoull(value, &used, 10);
+    } catch (const std::exception&) {
+        throw std::runtime_error(name + " must be a non-negative integer");
+    }
+    if (used != value.size() || parsed > 1024ULL * 1024ULL) {
+        throw std::runtime_error(name + " must be between 0 and 1048576 MiB");
+    }
+    return static_cast<std::uint64_t>(parsed);
 }
 
 Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
@@ -2588,6 +2902,14 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             if (options.maxCrossing > kHardMaxCrossing) {
                 throw std::runtime_error("--max-crossing must not exceed 16");
             }
+        } else if (arg == "--worker-memory-mb") {
+            options.workerMemoryMb = parseNonNegativeMb(needValue("--worker-memory-mb").text, "--worker-memory-mb");
+        } else if (arg == "--memory-reserve-mb") {
+            options.memoryReserveMb = parseNonNegativeMb(needValue("--memory-reserve-mb").text, "--memory-reserve-mb");
+        } else if (arg == "--cache-memory-mb") {
+            options.cacheMemoryMb = parseNonNegativeMb(needValue("--cache-memory-mb").text, "--cache-memory-mb");
+        } else if (arg == "--task-history") {
+            options.taskHistory = needValue("--task-history").path;
         } else if (arg == "--render-pd-svg") {
             options.renderPdSvg = true;
         } else if (arg == "--pd") {
@@ -2651,10 +2973,27 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path executable = lab::currentExecutablePath(args.empty() ? std::filesystem::path() : args[0].path);
         const lab::DataPaths dataPaths = lab::resolveDataFolder(executable, options.dataFolder);
-        lab::KnotEngine engine(executable, dataPaths, options.timeoutSeconds, options.maxCrossing);
+        const lab::AdaptiveMemoryController memory(
+            options.workerMemoryMb * lab::kMemoryMiB,
+            options.memoryReserveMb * lab::kMemoryMiB);
+        std::cerr << lab::configureServerOomProtection() << "\n";
+        lab::ComputeQueue computeQueue(memory);
+        lab::KnotEngine engine(
+            executable,
+            dataPaths,
+            options.timeoutSeconds,
+            options.maxCrossing,
+            memory,
+            computeQueue,
+            static_cast<std::size_t>(options.cacheMemoryMb * lab::kMemoryMiB));
+        std::cerr << memory.status() << "\n";
 
         const std::filesystem::path webRoot = lab::resolveWebRoot(executable, options.webRoot);
-        lab::TaskManager tasks;
+        const std::filesystem::path historyPath = options.taskHistory.empty()
+            ? executable.parent_path() / "state" / "tasks.history"
+            : lab::absolutePath(options.taskHistory);
+        lab::TaskManager tasks(historyPath);
+        std::cerr << "Task history: " << tasks.historyStatus() << "\n";
         lab::Application app(webRoot, engine, tasks);
         lab::HttpServer server(options.host, options.port, app);
         server.run();

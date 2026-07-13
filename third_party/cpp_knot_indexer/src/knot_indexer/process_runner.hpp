@@ -2,7 +2,10 @@
 
 #include "path_utils.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -14,10 +17,16 @@ struct WorkerResult {
     bool timedOut = false;
     bool interrupted = false;
     bool cancelled = false;
+    bool resourceExhausted = false;
     int exitCode = -1;
     double seconds = 0.0;
     std::string output;
     std::string error;
+};
+
+struct WorkerLimits {
+    std::uint64_t memoryBytes = 0;
+    int linuxOomScoreAdjust = 750;
 };
 
 WorkerResult runWorkerProcess(const std::filesystem::path& executable,
@@ -29,17 +38,20 @@ class WorkerProcess;
 
 std::unique_ptr<WorkerProcess> startWorkerProcess(const std::filesystem::path& executable,
                                                   const std::string& workerName,
-                                                  const std::string& input);
+                                                  const std::string& input,
+                                                  const WorkerLimits& limits = WorkerLimits{});
 bool pollWorkerProcess(WorkerProcess& process,
                        std::chrono::steady_clock::time_point deadline);
 WorkerResult finishWorkerProcess(WorkerProcess& process);
 void cancelWorkerProcess(WorkerProcess& process);
+void exhaustWorkerProcess(WorkerProcess& process, const std::string& reason);
 
 } // namespace hki
 
 #include "runtime_control.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -53,6 +65,7 @@ void cancelWorkerProcess(WorkerProcess& process);
 #include <windows.h>
 #else
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -135,8 +148,9 @@ class WorkerProcess {
 public:
     WorkerProcess(const std::filesystem::path& executable,
                   const std::string& workerName,
-                  const std::string& input)
-        : started_(std::chrono::steady_clock::now()) {
+                  const std::string& input,
+                  WorkerLimits limits)
+        : started_(std::chrono::steady_clock::now()), limits_(limits) {
         process_runner_detail::writeFile(temp_.input, input);
         start(executable, workerName);
     }
@@ -181,6 +195,15 @@ public:
         finalizeOutput();
     }
 
+    void exhaust(const std::string& reason) {
+        if (finished_) return;
+        terminate(false, false);
+        result_.resourceExhausted = true;
+        result_.exitCode = 126;
+        result_.error = reason;
+        finalizeOutput();
+    }
+
     WorkerResult finish() {
         while (!finished_) {
             poll(std::chrono::steady_clock::time_point::max());
@@ -197,10 +220,12 @@ private:
     process_runner_detail::TempFiles temp_;
     std::chrono::steady_clock::time_point started_;
     WorkerResult result_;
+    WorkerLimits limits_;
     bool finished_ = false;
 
 #ifdef _WIN32
     PROCESS_INFORMATION pi_{};
+    HANDLE job_ = nullptr;
 #else
     pid_t pid_ = -1;
     int status_ = 0;
@@ -229,11 +254,33 @@ private:
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
 
+        const DWORD creationFlags = CREATE_NO_WINDOW | (limits_.memoryBytes > 0 ? CREATE_SUSPENDED : 0);
         BOOL ok = CreateProcessW(executable.wstring().c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
-                                 CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi_);
+                                 creationFlags, nullptr, nullptr, &si, &pi_);
         CloseHandle(stderrHandle);
         if (!ok) {
             throw std::runtime_error("CreateProcessW failed for worker");
+        }
+        if (limits_.memoryBytes > 0) {
+            job_ = CreateJobObjectW(nullptr, nullptr);
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION info{};
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info.ProcessMemoryLimit = static_cast<SIZE_T>(limits_.memoryBytes);
+            const bool configured = job_ &&
+                SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &info, sizeof(info)) &&
+                AssignProcessToJobObject(job_, pi_.hProcess);
+            if (!configured) {
+                TerminateProcess(pi_.hProcess, 126);
+                WaitForSingleObject(pi_.hProcess, INFINITE);
+                closeHandles();
+                throw std::runtime_error("cannot apply worker memory limit");
+            }
+            if (ResumeThread(pi_.hThread) == static_cast<DWORD>(-1)) {
+                TerminateProcess(pi_.hProcess, 126);
+                WaitForSingleObject(pi_.hProcess, INFINITE);
+                closeHandles();
+                throw std::runtime_error("cannot resume memory-limited worker");
+            }
         }
 #else
         pid_ = fork();
@@ -248,6 +295,28 @@ private:
                 dup2(fileno(errFile), STDERR_FILENO);
                 std::fclose(errFile);
             }
+            if (limits_.memoryBytes > 0) {
+                struct rlimit limit{};
+                if (getrlimit(RLIMIT_AS, &limit) != 0) {
+                    std::fprintf(stderr, "cannot read worker memory limit: %s\n", std::strerror(errno));
+                    _exit(126);
+                }
+                const rlim_t requested = static_cast<rlim_t>(limits_.memoryBytes);
+                limit.rlim_cur = limit.rlim_max == RLIM_INFINITY ? requested : std::min(requested, limit.rlim_max);
+                if (setrlimit(RLIMIT_AS, &limit) != 0) {
+                    std::fprintf(stderr, "cannot apply worker memory limit: %s\n", std::strerror(errno));
+                    _exit(126);
+                }
+            }
+#if defined(__linux__)
+            if (limits_.linuxOomScoreAdjust > 0) {
+                FILE* score = std::fopen("/proc/self/oom_score_adj", "wb");
+                if (score) {
+                    std::fprintf(score, "%d", std::min(limits_.linuxOomScoreAdjust, 1000));
+                    std::fclose(score);
+                }
+            }
+#endif
             execl(exe.c_str(), exe.c_str(), "--worker", workerName.c_str(), "--input", in.c_str(),
                   "--output", out.c_str(), static_cast<char*>(nullptr));
             _exit(127);
@@ -297,15 +366,32 @@ private:
     void finalizeOutput() {
         if (finished_) return;
         result_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
-        result_.success = !result_.timedOut && !result_.interrupted && !result_.cancelled && result_.exitCode == 0;
+        result_.success = !result_.timedOut && !result_.interrupted && !result_.cancelled &&
+                          !result_.resourceExhausted && result_.exitCode == 0;
         if (result_.success) result_.output = process_runner_detail::readFile(temp_.output);
-        result_.error = process_runner_detail::readFile(temp_.error);
+        const std::string processError = process_runner_detail::readFile(temp_.error);
+        if (result_.error.empty()) result_.error = processError;
+        else if (!processError.empty()) result_.error += ": " + processError;
+        if (!result_.success && !result_.timedOut && !result_.interrupted && !result_.cancelled &&
+            limits_.memoryBytes > 0) {
+            const bool allocationFailure = result_.error.find("bad_alloc") != std::string::npos ||
+                result_.error.find("Cannot allocate memory") != std::string::npos ||
+                result_.error.find("cannot allocate memory") != std::string::npos ||
+                result_.error.find("worker memory limit") != std::string::npos;
+            if (allocationFailure || result_.exitCode == 134 || result_.exitCode == 137) {
+                result_.resourceExhausted = true;
+            }
+        }
         finished_ = true;
         closeHandles();
     }
 
     void closeHandles() {
 #ifdef _WIN32
+        if (job_) {
+            CloseHandle(job_);
+            job_ = nullptr;
+        }
         if (pi_.hThread) {
             CloseHandle(pi_.hThread);
             pi_.hThread = nullptr;
@@ -320,8 +406,9 @@ private:
 
 inline std::unique_ptr<WorkerProcess> startWorkerProcess(const std::filesystem::path& executable,
                                                   const std::string& workerName,
-                                                  const std::string& input) {
-    return std::unique_ptr<WorkerProcess>(new WorkerProcess(executable, workerName, input));
+                                                  const std::string& input,
+                                                  const WorkerLimits& limits) {
+    return std::unique_ptr<WorkerProcess>(new WorkerProcess(executable, workerName, input, limits));
 }
 
 inline bool pollWorkerProcess(WorkerProcess& process,
@@ -337,6 +424,10 @@ inline void cancelWorkerProcess(WorkerProcess& process) {
     process.cancel();
 }
 
+inline void exhaustWorkerProcess(WorkerProcess& process, const std::string& reason) {
+    process.exhaust(reason);
+}
+
 inline WorkerResult runWorkerProcess(const std::filesystem::path& executable,
                               const std::string& workerName,
                               const std::string& input,
@@ -344,7 +435,7 @@ inline WorkerResult runWorkerProcess(const std::filesystem::path& executable,
     const auto deadline = timeoutSeconds > 0
         ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds)
         : std::chrono::steady_clock::time_point::max();
-    std::unique_ptr<WorkerProcess> process = startWorkerProcess(executable, workerName, input);
+    std::unique_ptr<WorkerProcess> process = startWorkerProcess(executable, workerName, input, WorkerLimits{});
     while (!pollWorkerProcess(*process, deadline)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }

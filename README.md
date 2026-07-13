@@ -39,11 +39,20 @@ Open:
 http://127.0.0.1:5000
 ```
 
-The task monitor is available from the main page and directly at:
+Run the integration tests:
 
-```text
-http://127.0.0.1:5000/tasks.html
+```sh
+python test.py --rebuild
 ```
+
+Open Task Monitor from the navigation bar. The lookup interface and task
+monitor are two views of the same root page, so the browser URL remains `/`.
+
+Compute requests use a memory-aware FIFO queue. The server detects host and
+Linux cgroup limits, reserves memory for itself and the operating system, and
+applies a hard limit to each isolated compute worker. A computation can fail
+with `resource_exhausted`, but the server remains available and records the
+failure in its persistent task history.
 
 Generate an SVG diagram from a PD code without starting the server:
 

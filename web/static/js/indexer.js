@@ -1,4 +1,5 @@
 export default {
+  emits: ["navigate"],
   data() {
     return {
       desc_for_index_by_name_1:
@@ -65,6 +66,9 @@ export default {
     }
   },
   methods: {
+    showTasks() {
+      this.$emit("navigate", "tasks");
+    },
     replaceAllText(text, from, to) {
       return text.split(from).join(to);
     },
@@ -155,7 +159,7 @@ export default {
       this.knot_pd_diagram_error = task.pd_diagram_error || "";
       if (task.knot_types) {
         this.knot_name_list = task.knot_types;
-      } else if (task.status === "running") {
+      } else if (task.status === "running" || task.status === "queued") {
         this.knot_name_list = "...";
       } else {
         this.knot_name_list = task.error || "NOT_FOUND";
@@ -163,7 +167,7 @@ export default {
       this.homflypt_polynomial = this.taskResultText(task.homfly_status, task.homfly_result, task.homfly_error);
       this.khovanov_homology = this.expandComma(this.taskResultText(task.khovanov_status, task.khovanov_result, task.khovanov_error));
 
-      if (task.status === "running") {
+      if (task.status === "running" || task.status === "queued") {
         this.startSearchingSpinner();
       } else {
         this.knot_name_search_status = "";
@@ -584,7 +588,7 @@ export default {
     </div>
 
     <div class="page-actions">
-      <a class="btn btn-outline-info" href="/tasks.html">Task Monitor</a>
+      <button class="btn btn-outline-info" type="button" @click="showTasks">Task Monitor</button>
     </div>
 
     <div class="accordion indexer-accordion" id="accordionExample">
