@@ -64,6 +64,18 @@ Print the final HOMFLY-PT and Khovanov invariant strings to stderr. If PD-code
 simplification finishes successfully before the timeout, also print the
 simplified PD code to stderr.
 
+`--show-time`
+
+Print timing checkpoints to stderr. Times are elapsed seconds from the start of
+the lookup pipeline. The emitted checkpoints are:
+
+- HOMFLY-PT result selected
+- Khovanov result selected
+- simplified PD code computed, when simplification finishes successfully
+- simplification terminated, when the simplification worker is cancelled,
+  interrupted, or killed by timeout before producing a simplified PD code
+- knot-name lookup resolved, after the invariant data files have been queried
+
 `--verbose`
 
 Print worker status, elapsed time, failure details, timeout details,
@@ -89,7 +101,8 @@ by the shell. UTF-8 paths are supported as usual.
 Candidate knot names are written to stdout, one name per line.
 
 Diagnostics, verbose invariant strings, timeout messages, and worker failure
-details are written to stderr.
+details are written to stderr. Timing checkpoints from `--show-time` are also
+written to stderr and never to stdout.
 
 For each invariant type, the original-PD and simplified-PD computations race
 when both are available. The first successful HOMFLY-PT result is used and the

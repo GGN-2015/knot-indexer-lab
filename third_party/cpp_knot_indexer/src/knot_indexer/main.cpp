@@ -48,6 +48,7 @@ struct Options {
     bool verbose = false;
     bool printInvariants = false;
     bool banSimplify = false;
+    bool showTime = false;
 };
 
 struct DataPaths {
@@ -80,6 +81,7 @@ void usage(std::ostream& out) {
         << "  --data-folder PATH  Folder containing knotname-reg/, homfly/, and khovanov/ data.\n"
         << "  --ban-simplify      Do not simplify the input PD code before invariant lookup.\n"
         << "  --print-invariants  Print computed invariant strings to stderr.\n"
+        << "  --show-time         Print invariant, simplification, and lookup timing to stderr.\n"
         << "  --verbose           Print worker status, failures, and invariant strings to stderr.\n";
 }
 
@@ -192,6 +194,8 @@ Options parseOptions(const std::vector<cki::platform::ProgramArg>& args) {
             options.banSimplify = true;
         } else if (arg == "--print-invariants") {
             options.printInvariants = true;
+        } else if (arg == "--show-time") {
+            options.showTime = true;
         } else if (arg == "--verbose") {
             options.verbose = true;
         } else {
@@ -252,6 +256,15 @@ struct SelectedInvariant {
     std::vector<AttemptRecord> attempts;
 };
 
+struct TimingEvents {
+    std::chrono::steady_clock::time_point startedAt;
+    std::optional<double> homflyComputedSeconds;
+    std::optional<double> khovanovComputedSeconds;
+    std::optional<double> simplifiedPdComputedSeconds;
+    std::optional<double> simplifyTerminatedSeconds;
+    std::optional<double> knotNamesResolvedSeconds;
+};
+
 struct RunningAttempt {
     InvariantKind kind = InvariantKind::Homfly;
     std::string source;
@@ -266,6 +279,7 @@ struct InvariantPipelineResult {
     std::string simplifiedPd;
     bool simplifyEnabled = true;
     bool simplifiedUsable = false;
+    TimingEvents timings;
 };
 
 std::string workerNameFor(InvariantKind kind) {
@@ -282,6 +296,14 @@ SelectedInvariant& selectedFor(InvariantPipelineResult& result, InvariantKind ki
 
 const SelectedInvariant& selectedFor(const InvariantPipelineResult& result, InvariantKind kind) {
     return kind == InvariantKind::Homfly ? result.homfly : result.khovanov;
+}
+
+std::optional<double>& computedTimingFor(TimingEvents& timings, InvariantKind kind) {
+    return kind == InvariantKind::Homfly ? timings.homflyComputedSeconds : timings.khovanovComputedSeconds;
+}
+
+double elapsedSince(std::chrono::steady_clock::time_point startedAt) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count();
 }
 
 bool hasRunningSource(const std::vector<RunningAttempt>& running,
@@ -336,9 +358,10 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
     InvariantPipelineResult result;
     result.originalPd = canonicalPd;
     result.simplifyEnabled = enableSimplify;
+    result.timings.startedAt = std::chrono::steady_clock::now();
 
     const auto deadline = timeoutSeconds > 0
-        ? std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds)
+        ? result.timings.startedAt + std::chrono::seconds(timeoutSeconds)
         : std::chrono::steady_clock::time_point::max();
 
     std::vector<RunningAttempt> running;
@@ -362,6 +385,24 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
     bool simplifyFinished = !enableSimplify;
     bool simplifiedAttemptsStarted = false;
 
+    auto recordSimplifyTiming = [&]() {
+        if (result.simplify.success) {
+            if (!result.timings.simplifiedPdComputedSeconds) {
+                result.timings.simplifiedPdComputedSeconds = elapsedSince(result.timings.startedAt);
+            }
+        } else if (result.simplify.cancelled || result.simplify.timedOut || result.simplify.interrupted) {
+            if (!result.timings.simplifyTerminatedSeconds) {
+                result.timings.simplifyTerminatedSeconds = elapsedSince(result.timings.startedAt);
+            }
+        }
+    };
+
+    auto finishSimplifyProcess = [&]() {
+        result.simplify = finishWorkerProcess(*simplify);
+        simplifyFinished = true;
+        recordSimplifyTiming();
+    };
+
     auto maybeStartSimplifiedAttempts = [&]() {
         if (simplifiedAttemptsStarted || !result.simplifiedUsable) return;
         simplifiedAttemptsStarted = true;
@@ -375,7 +416,10 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
 
     while (true) {
         if (interrupted()) {
-            if (simplify && !simplifyFinished) cancelWorkerProcess(*simplify);
+            if (simplify && !simplifyFinished) {
+                cancelWorkerProcess(*simplify);
+                finishSimplifyProcess();
+            }
             for (RunningAttempt& attempt : running) cancelWorkerProcess(*attempt.process);
             result.homfly.result.interrupted = true;
             result.khovanov.result.interrupted = true;
@@ -383,8 +427,7 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
         }
 
         if (simplify && !simplifyFinished && pollWorkerProcess(*simplify, deadline)) {
-            result.simplify = finishWorkerProcess(*simplify);
-            simplifyFinished = true;
+            finishSimplifyProcess();
             if (result.simplify.success) {
                 result.simplifiedPd = result.simplify.output;
                 result.simplifiedUsable = !result.simplifiedPd.empty() && result.simplifiedPd != canonicalPd;
@@ -405,6 +448,8 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
             recordAttempt(selected, attempt.kind, attempt.source, workerResult);
             const bool selectedNow = workerResult.success && !wasAlreadySelected;
             if (selectedNow) {
+                std::optional<double>& computedSeconds = computedTimingFor(result.timings, attempt.kind);
+                if (!computedSeconds) computedSeconds = elapsedSince(result.timings.startedAt);
                 cancelRunningKind(running, attempt.kind);
             }
             running.erase(running.begin() + static_cast<std::ptrdiff_t>(i));
@@ -414,8 +459,7 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
         if (result.homfly.result.success && result.khovanov.result.success &&
             simplify && !simplifyFinished) {
             cancelWorkerProcess(*simplify);
-            result.simplify = finishWorkerProcess(*simplify);
-            simplifyFinished = true;
+            finishSimplifyProcess();
         }
 
         if (simplifyFinished) {
@@ -430,13 +474,18 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
         if (std::chrono::steady_clock::now() >= deadline) {
             if (simplify && !simplifyFinished) {
                 pollWorkerProcess(*simplify, deadline);
-                result.simplify = finishWorkerProcess(*simplify);
-                simplifyFinished = true;
+                finishSimplifyProcess();
             }
             for (RunningAttempt& attempt : running) {
                 pollWorkerProcess(*attempt.process, deadline);
                 WorkerResult workerResult = finishWorkerProcess(*attempt.process);
-                recordAttempt(selectedFor(result, attempt.kind), attempt.kind, attempt.source, workerResult);
+                SelectedInvariant& selected = selectedFor(result, attempt.kind);
+                const bool wasAlreadySelected = selected.result.success;
+                recordAttempt(selected, attempt.kind, attempt.source, workerResult);
+                if (workerResult.success && !wasAlreadySelected) {
+                    std::optional<double>& computedSeconds = computedTimingFor(result.timings, attempt.kind);
+                    if (!computedSeconds) computedSeconds = elapsedSince(result.timings.startedAt);
+                }
             }
             running.clear();
             break;
@@ -446,6 +495,34 @@ InvariantPipelineResult computeInvariantPipeline(const std::filesystem::path& ex
     }
 
     return result;
+}
+
+void printTimingLine(const char* label, double seconds) {
+    std::streamsize oldPrecision = std::cerr.precision();
+    std::ios::fmtflags oldFlags = std::cerr.flags();
+    std::cerr.setf(std::ios::fixed, std::ios::floatfield);
+    std::cerr.precision(6);
+    std::cerr << "Time " << label << ": +" << seconds << "s\n";
+    std::cerr.flags(oldFlags);
+    std::cerr.precision(oldPrecision);
+}
+
+void printTimingEvents(const TimingEvents& timings) {
+    if (timings.homflyComputedSeconds) {
+        printTimingLine("HOMFLY-PT computed", *timings.homflyComputedSeconds);
+    }
+    if (timings.khovanovComputedSeconds) {
+        printTimingLine("Khovanov computed", *timings.khovanovComputedSeconds);
+    }
+    if (timings.simplifiedPdComputedSeconds) {
+        printTimingLine("simplified PD code computed", *timings.simplifiedPdComputedSeconds);
+    }
+    if (timings.simplifyTerminatedSeconds) {
+        printTimingLine("simplification terminated", *timings.simplifyTerminatedSeconds);
+    }
+    if (timings.knotNamesResolvedSeconds) {
+        printTimingLine("knot names resolved", *timings.knotNamesResolvedSeconds);
+    }
 }
 
 void printWorkerStatus(const char* name, const WorkerResult& result) {
@@ -575,6 +652,7 @@ int main(int argc, char** argv) {
         hki::WorkerResult homResult = pipeline.homfly.result;
 
         if (hki::interrupted() || khResult.interrupted || homResult.interrupted) {
+            if (options.showTime) hki::printTimingEvents(pipeline.timings);
             std::cerr << "Interrupted; exiting cleanly.\n";
             return 130;
         }
@@ -590,6 +668,7 @@ int main(int argc, char** argv) {
         }
 
         if (!khResult.success && !homResult.success) {
+            if (options.showTime) hki::printTimingEvents(pipeline.timings);
             std::cerr << "Both invariant computations failed or timed out.\n";
             return 2;
         }
@@ -608,6 +687,8 @@ int main(int argc, char** argv) {
         std::vector<std::string> khNames = khResult.success ? hki::lookupInvariant(khDb, khResult.output) : std::vector<std::string>{};
         std::vector<std::string> homNames = homResult.success ? hki::lookupInvariant(homDb, homResult.output) : std::vector<std::string>{};
         candidates = hki::mergeCandidates(khResult, khNames, homResult, homNames);
+        pipeline.timings.knotNamesResolvedSeconds = hki::elapsedSince(pipeline.timings.startedAt);
+        if (options.showTime) hki::printTimingEvents(pipeline.timings);
         if (options.verbose) {
             std::cerr << "Text candidate count: " << candidates.size() << "\n";
         }

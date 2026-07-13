@@ -140,6 +140,15 @@ attempt does not prevent a simplified HOMFLY-PT attempt from being used later,
 and a failed HOMFLY-PT attempt does not affect Khovanov. Cancelled losing
 workers are diagnostics only; they are not treated as computation failures.
 
+When `--show-time` is enabled, the scheduler records elapsed-time checkpoints
+from the start of this pipeline. A HOMFLY-PT or Khovanov checkpoint is recorded
+when the first successful worker for that invariant type is selected. A
+simplified-PD checkpoint is recorded only when simplification returns a PD code;
+if the simplification worker is cancelled, interrupted, or killed by timeout
+first, a simplification-terminated checkpoint is recorded instead. The final
+knot-name checkpoint is recorded after the text invariant maps have been
+queried and candidate names have been merged.
+
 ## Timeout and Failure Degradation
 
 The public `--timeout SEC` value is a deadline for the full lookup pipeline.

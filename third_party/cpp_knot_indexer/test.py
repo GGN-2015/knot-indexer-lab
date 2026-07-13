@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -292,6 +293,52 @@ def assert_ban_simplify(exe: Path) -> None:
         raise AssertionError(f"ban-simplify print-invariants omitted invariant output\nstderr={printed.stderr}")
     if "Simplified PD code result:" in printed.stderr:
         raise AssertionError(f"ban-simplify print-invariants emitted simplified PD\nstderr={printed.stderr}")
+
+
+def assert_show_time(exe: Path) -> None:
+    proc = run([
+        str(exe),
+        "--pd-code",
+        str(CASES[2]["pd"]),
+        "--timeout",
+        "10",
+        "--show-time",
+    ], timeout=30)
+    if proc.returncode != 0:
+        raise AssertionError(f"show-time lookup failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
+    stdout_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if "K3a1" not in stdout_lines:
+        raise AssertionError(f"show-time lookup returned {stdout_lines!r}\nstderr={proc.stderr}")
+    if "HOMFLY-PT result:" in proc.stdout or "Khovanov result:" in proc.stdout:
+        raise AssertionError(f"show-time wrote invariant diagnostics to stdout\nstdout={proc.stdout}")
+
+    required = [
+        r"Time HOMFLY-PT computed: \+[0-9]+\.[0-9]{6}s",
+        r"Time Khovanov computed: \+[0-9]+\.[0-9]{6}s",
+        r"Time knot names resolved: \+[0-9]+\.[0-9]{6}s",
+    ]
+    for pattern in required:
+        if not re.search(pattern, proc.stderr):
+            raise AssertionError(f"show-time missing pattern {pattern!r}\nstderr={proc.stderr}")
+
+    simplify_computed = "Time simplified PD code computed:" in proc.stderr
+    simplify_terminated = "Time simplification terminated:" in proc.stderr
+    if not (simplify_computed or simplify_terminated):
+        raise AssertionError(f"show-time omitted simplify timing\nstderr={proc.stderr}")
+
+    banned = run([
+        str(exe),
+        "--pd-code",
+        str(CASES[2]["pd"]),
+        "--timeout",
+        "10",
+        "--show-time",
+        "--ban-simplify",
+    ], timeout=30)
+    if banned.returncode != 0:
+        raise AssertionError(f"show-time ban-simplify lookup failed\nstdout={banned.stdout}\nstderr={banned.stderr}")
+    if "Time simplified PD code computed:" in banned.stderr or "Time simplification terminated:" in banned.stderr:
+        raise AssertionError(f"show-time ban-simplify emitted simplify timing\nstderr={banned.stderr}")
 
 
 def assert_simplify_worker(exe: Path) -> None:
@@ -779,6 +826,8 @@ def main() -> int:
     print("PASS print-invariants-simplified-pd")
     assert_ban_simplify(exe)
     print("PASS ban-simplify")
+    assert_show_time(exe)
+    print("PASS show-time")
     assert_simplify_worker(exe)
     print("PASS simplify-worker")
     assert_auxiliary_modules(args.cxx)
