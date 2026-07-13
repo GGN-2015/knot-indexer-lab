@@ -112,6 +112,10 @@ def run_tests(exe: Path) -> None:
             assert records[0]["homfly_status"] == "resource_exhausted", records[0]
             with opener.open(base_url + "/api/last_build_info", timeout=5) as response:
                 assert response.status == 200
+                build_info = response.read().decode("utf-8")
+                assert "Invariant data" not in build_info
+                assert "Name normalization data" not in build_info
+                assert "Name-to-PD data" not in build_info
 
             redirect_opener = urllib.request.build_opener(NoRedirect())
             try:

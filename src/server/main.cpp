@@ -2002,14 +2002,6 @@ public:
         return namePdLookup_.lookup(canonicalName, error);
     }
 
-    std::string nameIndexStatus() const {
-        return "Invariant data source: text files " +
-               cki::platform::displayPath(dataPaths_.homflyDb) + " and " +
-               cki::platform::displayPath(dataPaths_.khovanovDb) +
-               "\nName normalization data: " + cki::platform::displayPath(dataPaths_.knotNameRegDir) +
-               "\nName-to-PD data: " + namePdLookup_.statusMessage();
-    }
-
     int maxCrossing() const {
         return maxCrossing_;
     }
@@ -2657,8 +2649,7 @@ private:
             std::ostringstream info;
             info << "Pure C++ knot-indexer-lab server\n"
                  << "Invariant timeout: " << kMaxComputeTimeoutSeconds << " seconds\n"
-                 << "Maximum total crossing number: " << engine_.maxCrossing() << "\n"
-                 << "Invariant data: " << engine_.nameIndexStatus() << "\n";
+                 << "Maximum total crossing number: " << engine_.maxCrossing() << "\n";
             return makeText(200, "OK", info.str(), "text/plain; charset=utf-8");
         }
 
