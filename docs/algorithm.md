@@ -152,7 +152,7 @@ same browser task session and restores the latest submitted task state.
 ## Third-Party Code
 
 The `third_party/cpp_knot_indexer` tree is vendored from
-[`GGN-2015/cpp_knot_indexer`](https://github.com/GGN-2015/cpp_knot_indexer).
+[`TopologicalKnotIndexer/cpp_knot_indexer`](https://github.com/TopologicalKnotIndexer/cpp_knot_indexer).
 It includes the HOMFLY-PT, Khovanov, and PD-code simplification
 implementations used by this server. This vendored copy was refreshed from
 upstream commit `e0daec4e0f9163065f9df004e7c6e926a92ebae7`.

@@ -3,7 +3,7 @@
 `knot-indexer-lab` is a pure C++17 web server for knot lookup. The web UI keeps
 the same Bootstrap/Vue layout as the earlier `knot-indexer-lab`, while the
 calculation path uses the pure C++ implementation from
-[`GGN-2015/cpp_knot_indexer`](https://github.com/GGN-2015/cpp_knot_indexer).
+[`TopologicalKnotIndexer/cpp_knot_indexer`](https://github.com/TopologicalKnotIndexer/cpp_knot_indexer).
 
 Knot Genus and Knot Volume are intentionally not present in this version.
 
@@ -114,7 +114,7 @@ If you use this project in academic work, please cite it as:
   title        = {knot-indexer-lab: A Pure C++ Knot Retrieval Server},
   author       = {GGN-2015},
   year         = {2026},
-  url          = {https://github.com/GGN-2015/knot-indexer},
+  url          = {https://github.com/TopologicalKnotIndexer/knot-indexer-lab},
   note         = {Pure C++ implementation with upstream text invariant data, HOMFLY-PT polynomial computation, and Khovanov homology computation}
 }
 ```
