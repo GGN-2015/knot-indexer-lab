@@ -112,7 +112,7 @@ If you use this project in academic work, please cite it as:
 ```bibtex
 @software{knot_indexer_lab_cpp,
   title        = {knot-indexer-lab: A Pure C++ Knot Retrieval Server},
-  author       = {GGN-2015},
+  author = {{GGN\_2015}},
   year         = {2026},
   url          = {https://github.com/TopologicalKnotIndexer/knot-indexer-lab},
   note         = {Pure C++ implementation with upstream text invariant data, HOMFLY-PT polynomial computation, and Khovanov homology computation}
